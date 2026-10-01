@@ -1,0 +1,2885 @@
+"""
+5G-PacketSense Integrated - Unified packet analysis and live capture system.
+
+This is the main Flask application that serves as the backend for the
+5G-PacketSense platform. It provides:
+
+- REST API endpoints for PCAP file upload, analysis, and querying
+- WebSocket-based real-time packet streaming via Flask-SocketIO
+- Live packet capture using Scapy (requires admin/root privileges)
+- Switch monitoring mode for enterprise VPN detection
+- Multi-layer VPN detection (keyword, ASN, IP database, API)
+- GeoIP-based packet flow visualization data
+- DuckDB-powered SQL analytics on Parquet-formatted packet data
+
+Usage:
+    python app.py                          # Start web server on port 5000
+    python app.py data/parquet/file.parquet # Pre-load a parquet file
+
+Requirements:
+    - Python 3.8+
+    - Admin/root privileges for live capture
+    - Npcap (Windows) or libpcap (Linux/macOS) for packet capture
+
+See README.md for full setup and usage instructions.
+"""
+
+import platform
+from flask import Flask, jsonify, request, send_from_directory
+from flask_socketio import SocketIO, emit
+from flask_cors import CORS
+from scapy.all import sniff, IP, TCP, UDP, wrpcap
+import duckdb
+from pathlib import Path
+
+try:
+    import geoip2.database
+    from maxminddb import InvalidDatabaseError
+except ImportError:
+    geoip2 = None
+    InvalidDatabaseError = Exception
+from collections import defaultdict, deque
+import json
+import os
+import sys
+import time
+import threading
+import requests
+import socket
+from datetime import datetime
+from dotenv import load_dotenv
+from src.agents.llm_client import LLMClient
+
+load_dotenv()
+
+app = Flask(__name__, static_folder="static")
+app.config["SECRET_KEY"] = "packetsense-integrated-secret-key"
+CORS(app)
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
+
+
+@app.after_request
+def add_header(response):
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
+
+
+# ============================================================================
+# CONFIGURATION AND GLOBALS
+# ============================================================================
+
+# LLM Client (lazy init)
+llm_client = None
+
+# DuckDB connection for PCAP analysis
+conn = None
+parquet_path = None
+
+# Live capture configuration
+CAPTURE_INTERFACE = None  # None means all interfaces
+CAPTURE_SNAPLEN = (
+    96  # Capture only headers (96 bytes) for performance - ignores payload
+)
+MAX_HISTORY = 1000
+GEOIP_CACHE = {}
+packet_history = deque(maxlen=MAX_HISTORY)
+capture_running = False
+user_public_location = None
+
+# Packet storage for saving to disk
+captured_packets = []  # Store raw Scapy packets
+capture_session_name = None
+
+# ============================================================================
+# SWITCH MONITORING MODE
+# Monitors all traffic on a switch (requires port mirroring / SPAN configured)
+# Tracks per-device VPN usage for all devices connected to the switch
+# ============================================================================
+
+SWITCH_MONITOR_MODE = False  # Enabled via API or CLI
+SWITCH_INTERFACE = None  # The interface connected to the switch mirror port
+SWITCH_SUBNET = None  # e.g. '172.16.0.0/16' - the organization's internal subnet
+SWITCH_MONITOR_RUNNING = False
+
+# Per-device tracking for switch monitoring
+# Key: internal IP, Value: device info dict
+switch_devices = {}  # All devices seen on the switch
+switch_vpn_alerts = []  # VPN alert log with timestamps
+switch_device_lock = threading.Lock()  # Thread safety for device tracking
+
+# ============================================================================
+# ENHANCED VPN DETECTION SYSTEM
+# Uses multiple public databases and heuristics for accurate VPN detection
+# ============================================================================
+
+# Layer 1: ISP/Org keyword matching (original approach, expanded)
+VPN_PROVIDERS = {
+    "NordVPN": ["nordvpn", "nord vpn", "tesonet", "tefincom"],
+    "ExpressVPN": ["expressvpn", "express vpn", "express networks"],
+    "ProtonVPN": ["protonvpn", "proton vpn", "proton ag", "proton technologies"],
+    "Surfshark": ["surfshark"],
+    "Private Internet Access": [
+        "private internet access",
+        "london trust media",
+        "kape technologies",
+    ],
+    "CyberGhost": ["cyberghost", "cg server"],
+    "IPVanish": ["ipvanish", "mudhook marketing", "stackpath"],
+    "Mullvad": ["mullvad", "aeza group", "31173 services"],
+    "TunnelBear": ["tunnelbear"],
+    "Windscribe": ["windscribe"],
+    "VyprVPN": ["vyprvpn", "golden frog"],
+    "HideMyAss": ["hidemyass", "hma", "privax"],
+    "TorGuard": ["torguard"],
+    "Perfect Privacy": ["perfect privacy", "perfect-privacy"],
+    "AirVPN": ["airvpn"],
+    "IVPN": ["ivpn"],
+    "VPN.ac": ["vpn.ac", "netlabs"],
+    "ZenMate": ["zenmate"],
+    "Atlas VPN": ["atlas vpn", "atlasvpn"],
+    "Hotspot Shield": ["hotspot shield", "anchorfree", "pango", "aura"],
+    "PrivateVPN": ["privatevpn"],
+    "StrongVPN": ["strongvpn", "reliablehosting"],
+    "VPN Unlimited": ["vpn unlimited", "keepsolid"],
+    "PureVPN": ["purevpn", "gaditek"],
+    "Astrill": ["astrill"],
+    "VPN.ht": ["vpn.ht"],
+    "BTGuard": ["btguard"],
+    "Anonymizer": ["anonymizer"],
+    "Trust.Zone": ["trust.zone", "trustzone"],
+    "VPNSecure": ["vpnsecure"],
+    "BolehVPN": ["bolehvpn"],
+    "hide.me": ["hide.me", "eventnet", "ehostserver"],
+    "Mozilla VPN": ["mozilla vpn", "mullvad"],
+    "Kaspersky VPN": ["kaspersky"],
+    "Norton VPN": ["norton", "symantec"],
+    "Bitdefender VPN": ["bitdefender"],
+    "F-Secure VPN": ["f-secure", "freedome"],
+    "Avira VPN": ["avira"],
+    "McAfee VPN": ["mcafee"],
+    "Psiphon": ["psiphon"],
+    "Lantern": ["lantern"],
+    "Opera VPN": ["opera vpn", "surfeasy"],
+    "1.1.1.1 WARP": ["cloudflare warp", "cloudflare, inc"],
+    "iCloud Private Relay": ["apple private relay", "aaplrelay"],
+}
+
+# Layer 2: Known VPN-associated ASN numbers (publicly documented)
+# Sources: bgp.tools, PeeringDB, security research publications
+VPN_ASN_DATABASE = {
+    # NordVPN / Tesonet
+    "AS212238": "NordVPN",
+    "AS394711": "NordVPN",
+    "AS210565": "NordVPN",
+    # ExpressVPN
+    "AS394711": "ExpressVPN",
+    "AS18450": "ExpressVPN",
+    # ProtonVPN
+    "AS209103": "ProtonVPN",
+    "AS51852": "ProtonVPN",
+    # Surfshark
+    "AS212238": "Surfshark",
+    # Mullvad
+    "AS198093": "Mullvad",
+    "AS31173": "Mullvad",
+    # Private Internet Access (PIA)
+    "AS26496": "Private Internet Access",
+    # CyberGhost
+    "AS44592": "CyberGhost",
+    # IPVanish
+    "AS33438": "IPVanish",
+    "AS55286": "IPVanish",
+    # TorGuard
+    "AS399532": "TorGuard",
+    # Windscribe
+    "AS25379": "Windscribe",
+    # VyprVPN / Golden Frog
+    "AS36351": "VyprVPN",
+    # HideMyAss / Privax
+    "AS198605": "HideMyAss",
+    # AirVPN
+    "AS205467": "AirVPN",
+    # IVPN
+    "AS398789": "IVPN",
+    # PureVPN
+    "AS55286": "PureVPN",
+    # Hosting providers heavily used by VPN services
+    "AS9009": "M247 (VPN Infrastructure)",
+    "AS8100": "QuadraNet (VPN Host)",
+    "AS60068": "Datacamp (VPN Host)",
+    "AS62904": "Eonix (VPN Host)",
+    "AS44477": "Stark Industries (VPN Host)",
+    "AS201011": "Netzbetrieb (VPN Host)",
+    "AS49505": "Selectel (VPN Host)",
+    "AS51167": "Contabo (VPN Host)",
+    "AS20473": "Choopa/Vultr (VPN Host)",
+    "AS30633": "Leaseweb (VPN Host)",
+    "AS212238": "Datacamp (VPN Host)",
+    "AS46562": "TotalServer (VPN Host)",
+    "AS36352": "ColoCrossing (VPN Host)",
+    "AS62563": "GTHost (VPN Host)",
+    "AS209854": "Xhostfire (VPN Host)",
+    "AS213371": "Squitter (VPN Host)",
+}
+
+# Layer 3: Known VPN IP CIDR ranges (from X4BNet/lists_vpn and public sources)
+# These are updated periodically from: github.com/X4BNet/lists_vpn
+VPN_IP_RANGES_V4 = []  # Populated at startup from downloaded lists
+VPN_IP_RANGES_LOADED = False
+
+# Layer 4: Public VPN detection API (vpnapi.io - 1000 free queries/day)
+VPNAPI_IO_KEY = os.getenv("VPNAPI_IO_KEY", "")  # Optional free API key
+
+# VPN detection cache and tracking
+VPN_CACHE = {}  # Cache VPN detection results
+vpn_ips = set()  # Track unique VPN IPs detected
+
+# VPN protocol port signatures (used for DPI-lite in switch monitoring)
+VPN_PROTOCOL_PORTS = {
+    443: "HTTPS/SSL VPN",  # OpenVPN (TCP), SSTP, many commercial VPNs
+    1194: "OpenVPN",  # OpenVPN default
+    1195: "OpenVPN (alt)",  # OpenVPN alternate
+    500: "IKE (IPSec)",  # IPSec IKE
+    4500: "IPSec NAT-T",  # IPSec NAT traversal
+    1701: "L2TP",  # L2TP
+    1723: "PPTP",  # PPTP
+    51820: "WireGuard",  # WireGuard default
+    51821: "WireGuard (alt)",  # WireGuard alternate
+    4443: "OpenVPN (alt)",  # Common OpenVPN alternate
+    8443: "OpenVPN (alt)",  # Common OpenVPN alternate
+    9201: "WireGuard (alt)",  # Some WireGuard configs
+    41194: "Mullvad OpenVPN",  # Mullvad specific
+    53: "DNS/VPN tunnel",  # DNS tunneling / some VPNs
+}
+
+# ============================================================================
+# VPN IP LIST DOWNLOADER (X4BNet public GitHub lists)
+# ============================================================================
+
+import ipaddress
+
+
+def download_vpn_ip_lists():
+    """Download VPN IP ranges from X4BNet public GitHub repository.
+    Source: https://github.com/X4BNet/lists_vpn (updated daily)
+    This is a widely-used public database of known VPN IP ranges.
+    """
+    global VPN_IP_RANGES_V4, VPN_IP_RANGES_LOADED
+
+    vpn_lists_dir = Path("data/vpn_lists")
+    vpn_lists_dir.mkdir(parents=True, exist_ok=True)
+
+    # X4BNet VPN IP list URLs (public, updated daily)
+    sources = {
+        "x4bnet_ipv4": "https://raw.githubusercontent.com/X4BNet/lists_vpn/main/output/vpn/ipv4.txt",
+    }
+
+    loaded_networks = []
+    cache_max_age = 86400  # Re-download after 24 hours
+
+    for name, url in sources.items():
+        cache_file = vpn_lists_dir / f"{name}.txt"
+        should_download = True
+
+        # Check if cached file exists and is recent
+        if cache_file.exists():
+            file_age = time.time() - cache_file.stat().st_mtime
+            if file_age < cache_max_age:
+                should_download = False
+                print(f"[VPN-DB] Using cached {name} list (age: {int(file_age/3600)}h)")
+
+        if should_download:
+            try:
+                print(f"[VPN-DB] Downloading {name} from X4BNet...")
+                resp = requests.get(url, timeout=15)
+                if resp.status_code == 200:
+                    cache_file.write_text(resp.text)
+                    print(
+                        f"[VPN-DB] Downloaded {name}: {len(resp.text.splitlines())} entries"
+                    )
+                else:
+                    print(
+                        f"[VPN-DB] Failed to download {name}: HTTP {resp.status_code}"
+                    )
+                    if not cache_file.exists():
+                        continue
+            except Exception as e:
+                print(f"[VPN-DB] Download error for {name}: {e}")
+                if not cache_file.exists():
+                    continue
+
+        # Parse the IP list
+        try:
+            lines = cache_file.read_text().strip().splitlines()
+            for line in lines:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    try:
+                        network = ipaddress.ip_network(line, strict=False)
+                        loaded_networks.append(network)
+                    except ValueError:
+                        pass
+            print(f"[VPN-DB] Loaded {len(loaded_networks)} networks from {name}")
+        except Exception as e:
+            print(f"[VPN-DB] Parse error for {name}: {e}")
+
+    # Also load Tor exit nodes from dan.me.uk (public list)
+    tor_cache = vpn_lists_dir / "tor_exit_nodes.txt"
+    should_download_tor = True
+    if tor_cache.exists():
+        file_age = time.time() - tor_cache.stat().st_mtime
+        if file_age < cache_max_age:
+            should_download_tor = False
+
+    if should_download_tor:
+        try:
+            print("[VPN-DB] Downloading Tor exit node list...")
+            resp = requests.get("https://www.dan.me.uk/torlist/?exit", timeout=15)
+            if resp.status_code == 200:
+                tor_cache.write_text(resp.text)
+                print(
+                    f"[VPN-DB] Downloaded Tor exit nodes: {len(resp.text.splitlines())} entries"
+                )
+        except Exception as e:
+            print(f"[VPN-DB] Tor list download error: {e}")
+
+    if tor_cache.exists():
+        try:
+            tor_ips = set()
+            for line in tor_cache.read_text().strip().splitlines():
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    try:
+                        # Single IPs - convert to /32 network
+                        network = ipaddress.ip_network(f"{line}/32", strict=False)
+                        loaded_networks.append(network)
+                        tor_ips.add(line)
+                    except ValueError:
+                        pass
+            print(f"[VPN-DB] Loaded {len(tor_ips)} Tor exit nodes")
+        except Exception as e:
+            print(f"[VPN-DB] Tor list parse error: {e}")
+
+    VPN_IP_RANGES_V4 = loaded_networks
+    VPN_IP_RANGES_LOADED = True
+    print(f"[VPN-DB] Total VPN/Proxy IP networks loaded: {len(VPN_IP_RANGES_V4)}")
+
+
+def check_ip_in_vpn_ranges(ip_str):
+    """Check if an IP is in the downloaded VPN IP range databases.
+    Uses binary search on sorted CIDR ranges for efficiency.
+    """
+    if not VPN_IP_RANGES_LOADED or not VPN_IP_RANGES_V4:
+        return False
+    try:
+        ip = ipaddress.ip_address(ip_str)
+        for network in VPN_IP_RANGES_V4:
+            if ip in network:
+                return True
+    except ValueError:
+        pass
+    return False
+
+
+def check_vpnapi_io(ip_str):
+    """Query vpnapi.io free public API for VPN/proxy detection.
+    Free tier: 1000 queries/day. No key needed for basic use.
+    API docs: https://vpnapi.io/
+    """
+    try:
+        url = f"https://vpnapi.io/api/{ip_str}"
+        if VPNAPI_IO_KEY:
+            url += f"?key={VPNAPI_IO_KEY}"
+        resp = requests.get(url, timeout=3)
+        if resp.status_code == 200:
+            data = resp.json()
+            security = data.get("security", {})
+            if security.get("vpn") or security.get("proxy") or security.get("tor"):
+                provider = "Unknown VPN"
+                if security.get("tor"):
+                    provider = "Tor Network"
+                elif security.get("proxy"):
+                    provider = "Proxy Service"
+                else:
+                    # Try to extract provider from network info
+                    network = data.get("network", {})
+                    provider = network.get(
+                        "autonomous_system_organization", "VPN Service"
+                    )
+                return {"is_vpn": True, "provider": provider, "method": "vpnapi.io"}
+    except Exception as e:
+        pass  # Silently fail - this is a supplementary check
+    return None
+
+
+# Live capture statistics
+live_stats = {
+    "total_packets": 0,
+    "tcp_packets": 0,
+    "udp_packets": 0,
+    "unique_ips": set(),
+    "unique_src_ips": set(),
+    "unique_dst_ips": set(),
+    "connections": {},
+    "start_time": None,
+    "total_bytes": 0,
+    "protocols": defaultdict(int),
+    "ports": defaultdict(int),
+    "top_talkers": defaultdict(int),
+    "vpn_ips": set(),  # Track VPN IPs
+    "vpn_details": {},  # Track VPN detection details keyed by IP
+}
+
+# Default Column Mapping for DuckDB
+COLS = {
+    "time": '"timestamp"',
+    "len": '"length"',
+    "proto": '"protocol"',
+    "src": '"src_ip"',
+    "dst": '"dst_ip"',
+    "ttl": '"ttl"',
+    "number": '"frame_no"',
+    "tcp_src": '"src_port"',
+    "tcp_dst": '"dst_port"',
+    "udp_src": '"src_port"',
+    "udp_dst": '"dst_port"',
+}
+
+# GeoIP reader
+try:
+    from maxminddb_geolite2 import open_database
+
+    geo_reader = open_database()
+except:
+    geo_reader = None
+    print(
+        "[WARN] GeoIP database not available. Install: pip install maxminddb-geolite2"
+    )
+
+# ============================================================================
+# LLM FUNCTIONS
+# ============================================================================
+
+
+def get_llm():
+    """Initialize and return LLM client"""
+    global llm_client
+    if llm_client is None:
+        # Check for provider preference (default to ollama for local setup)
+        provider = os.getenv("LLM_PROVIDER", "ollama").lower()
+
+        # Get API key based on provider
+        if provider == "ollama":
+            api_key = None  # Ollama doesn't need API key
+        elif provider == "openrouter":
+            api_key = os.getenv("OPENROUTER_API_KEY")
+        elif provider == "anthropic":
+            api_key = os.getenv("ANTHROPIC_API_KEY")
+        elif provider == "openai":
+            api_key = os.getenv("OPENAI_API_KEY")
+        elif provider == "gemini":
+            api_key = os.getenv("GEMINI_API_KEY")
+        else:
+            # Fallback: try to find any available API key
+            api_key = (
+                os.getenv("OPENROUTER_API_KEY")
+                or os.getenv("ANTHROPIC_API_KEY")
+                or os.getenv("OPENAI_API_KEY")
+            )
+            provider = "openrouter" if os.getenv("OPENROUTER_API_KEY") else "anthropic"
+
+        try:
+            llm_client = LLMClient(api_key=api_key, provider=provider)
+            print(f"[INFO] Initialized LLM client with provider: {provider}")
+        except Exception as e:
+            print(f"[WARN] LLM Client init failed: {e}")
+            llm_client = None
+    return llm_client
+
+
+# ============================================================================
+# DUCKDB / PARQUET FUNCTIONS (FROM 5G-PACKETSENSE)
+# ============================================================================
+
+
+def detect_columns(conn):
+    """Detect column schema (live capture uses simple schema: src_ip, dst_ip, etc.)"""
+    global COLS
+    try:
+        schema = conn.execute("DESCRIBE packets").fetchall()
+        cols = [c[0] for c in schema]
+        print(f"[INFO] Detected columns: {cols}")
+        # Live capture schema is already set in COLS by default
+    except Exception as e:
+        print(f"[WARN] Column detection failed: {e}")
+
+
+def load_parquet(path: str):
+    """Load Parquet file into DuckDB"""
+    global conn, parquet_path
+    parquet_path = path
+    conn = duckdb.connect(":memory:")
+    conn.execute(f"CREATE TABLE packets AS SELECT * FROM read_parquet('{path}')")
+
+    # Verify count
+    try:
+        count = conn.execute("SELECT COUNT(*) FROM packets").fetchone()[0]
+        print(f"[OK] Loaded {path} into DuckDB (Rows: {count})")
+    except:
+        print(f"[OK] Loaded {path} into DuckDB")
+
+    detect_columns(conn)
+
+
+# ============================================================================
+# GEOLOCATION FUNCTIONS
+# ============================================================================
+
+
+def get_geolocation(ip: str) -> dict:
+    """Get geolocation for IP address - returns None for unknown locations"""
+    # Try cache first
+    if ip in GEOIP_CACHE:
+        return GEOIP_CACHE[ip].copy()
+
+    # Handle private IPs - use user's location
+    if is_private_ip(ip):
+        fallback = get_user_public_location()
+        if fallback:
+            import random
+
+            location = {
+                "ip": ip,
+                "lat": fallback["lat"] + random.uniform(-0.5, 0.5),
+                "lon": fallback["lon"] + random.uniform(-0.5, 0.5),
+                "country": fallback["country"],
+                "city": "Local Network",
+                "isp": "Private Network",
+                "asn": "N/A",
+                "is_private": True,
+            }
+            GEOIP_CACHE[ip] = location
+            return location
+        # No user location available, return None
+        return None
+
+    # Try GeoLite2 database
+    if geo_reader:
+        try:
+            response = geo_reader.get(ip)
+            if response and "location" in response:
+                lat = response["location"].get("latitude", 0)
+                lon = response["location"].get("longitude", 0)
+                if lat != 0 or lon != 0:
+                    location = {
+                        "ip": ip,
+                        "lat": lat,
+                        "lon": lon,
+                        "country": response.get("country", {})
+                        .get("names", {})
+                        .get("en", "Unknown"),
+                        "city": response.get("city", {})
+                        .get("names", {})
+                        .get("en", "Unknown"),
+                        "isp": "Unknown",
+                        "asn": "Unknown",
+                        "is_private": False,
+                    }
+                    GEOIP_CACHE[ip] = location
+                    return location
+        except:
+            pass
+
+    # Try live API as fallback for public IPs (used when loading PCAP files)
+    # Request proxy/hosting fields for VPN detection
+    try:
+        response = requests.get(
+            f"http://ip-api.com/json/{ip}?fields=status,country,city,lat,lon,isp,as,query,proxy,hosting",
+            timeout=2,
+        )
+        if response.status_code == 200:
+            data = response.json()
+            if data.get("status") == "success":
+                isp = data.get("isp", "Unknown")
+                asn = data.get("as", "Unknown")
+                is_proxy = data.get("proxy", False)
+                is_hosting = data.get("hosting", False)
+
+                # Detect VPN using enhanced multi-layer detection
+                vpn_info = detect_vpn(ip, isp, asn)
+
+                # If ip-api says it's a proxy but our detector missed it
+                if not vpn_info["is_vpn"] and is_proxy:
+                    vpn_info = {
+                        "is_vpn": True,
+                        "provider": f"Proxy/VPN ({isp})",
+                        "method": "ip-api-proxy",
+                    }
+                    VPN_CACHE[f"{ip}_{isp}_{asn}"] = vpn_info
+
+                location = {
+                    "ip": ip,
+                    "lat": data.get("lat", 0),
+                    "lon": data.get("lon", 0),
+                    "country": data.get("country", "Unknown"),
+                    "city": data.get("city", "Unknown"),
+                    "isp": isp,
+                    "asn": asn,
+                    "is_private": False,
+                    "is_vpn": vpn_info["is_vpn"],
+                    "vpn_provider": vpn_info.get("provider"),
+                    "vpn_method": vpn_info.get("method"),
+                    "is_hosting": is_hosting,
+                }
+                GEOIP_CACHE[ip] = location
+
+                # Track VPN IPs globally
+                if vpn_info["is_vpn"]:
+                    vpn_ips.add(ip)
+
+                print(
+                    f"[INFO] Got geolocation for {ip}: {location['city']}, {location['country']}"
+                )
+                if vpn_info["is_vpn"]:
+                    print(
+                        f"[VPN] {ip} identified as {vpn_info.get('provider')} via {vpn_info.get('method')}"
+                    )
+                return location
+    except Exception as e:
+        print(f"[WARN] API geolocation failed for {ip}: {e}")
+
+    # Location unknown - return None instead of hash-based fake location
+    return None
+
+
+def is_private_ip(ip: str) -> bool:
+    """Check if IP is private"""
+    if ":" in ip:
+        return ip.startswith("fe80:") or ip.startswith("fc") or ip == "::1"
+    try:
+        parts = ip.split(".")
+        if len(parts) != 4:
+            return True
+        first = int(parts[0])
+        return (
+            first in [10, 127, 0]
+            or (first == 172 and 16 <= int(parts[1]) <= 31)
+            or (first == 192 and int(parts[1]) == 168)
+            or first >= 224
+        )
+    except:
+        return True
+
+
+def get_mock_location(ip: str, is_ipv6: bool = False) -> dict:
+    """Generate mock location for private IPs"""
+    import hashlib
+
+    cities = [
+        {"city": "Prayagraj", "country": "India", "lat": 25.4358, "lon": 81.8463},
+        {"city": "Delhi", "country": "India", "lat": 28.6139, "lon": 77.2090},
+        {"city": "Mumbai", "country": "India", "lat": 19.0760, "lon": 72.8777},
+        {"city": "Bangalore", "country": "India", "lat": 12.9716, "lon": 77.5946},
+        {"city": "Chennai", "country": "India", "lat": 13.0827, "lon": 80.2707},
+        {"city": "Kolkata", "country": "India", "lat": 22.5726, "lon": 88.3639},
+        {"city": "Hyderabad", "country": "India", "lat": 17.3850, "lon": 78.4867},
+        {"city": "Pune", "country": "India", "lat": 18.5204, "lon": 73.8567},
+        {"city": "Jaipur", "country": "India", "lat": 26.9124, "lon": 75.7873},
+        {"city": "Lucknow", "country": "India", "lat": 26.8467, "lon": 80.9462},
+        {"city": "Singapore", "country": "Singapore", "lat": 1.3521, "lon": 103.8198},
+        {"city": "Dubai", "country": "UAE", "lat": 25.2048, "lon": 55.2708},
+        {"city": "London", "country": "UK", "lat": 51.5074, "lon": -0.1278},
+        {"city": "New York", "country": "USA", "lat": 40.7128, "lon": -74.0060},
+        {"city": "Tokyo", "country": "Japan", "lat": 35.6762, "lon": 139.6503},
+        {"city": "Sydney", "country": "Australia", "lat": -33.8688, "lon": 151.2093},
+    ]
+    ip_hash = int(hashlib.md5(ip.encode()).hexdigest()[:8], 16)
+    location = cities[ip_hash % len(cities)]
+    lat_offset = ((ip_hash % 100) / 1000.0) - 0.05
+    lon_offset = ((ip_hash % 100) / 1000.0) - 0.05
+    return {
+        "lat": location["lat"] + lat_offset,
+        "lon": location["lon"] + lon_offset,
+        "country": location["country"],
+        "city": location["city"],
+    }
+
+
+def get_local_ip_addresses():
+    """Get all local IP addresses of the machine"""
+    local_ips = []
+    try:
+        # Get hostname
+        hostname = socket.gethostname()
+        # Get all IPs associated with hostname
+        ip_list = socket.getaddrinfo(hostname, None)
+        for ip_info in ip_list:
+            ip = ip_info[4][0]
+            # Filter out IPv6 and loopback
+            if ":" not in ip and not ip.startswith("127."):
+                if ip not in local_ips:
+                    local_ips.append(ip)
+    except Exception as e:
+        print(f"[WARN] Error getting local IPs: {e}")
+
+    # Add common private IP ranges if nothing found
+    if not local_ips:
+        try:
+            # Try connecting to external server to find default interface IP
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            local_ip = s.getsockname()[0]
+            s.close()
+            local_ips.append(local_ip)
+        except:
+            pass
+
+    return local_ips
+
+
+def get_user_public_location():
+    """Get user's public IP location for live capture"""
+    global user_public_location
+    if user_public_location:
+        return user_public_location
+
+    try:
+        response = requests.get("https://api.ipify.org?format=json", timeout=3)
+        if response.status_code == 200:
+            public_ip = response.json().get("ip")
+            response = requests.get(
+                f"http://ip-api.com/json/{public_ip}?fields=status,country,city,lat,lon,isp,as,query",
+                timeout=3,
+            )
+            if response.status_code == 200:
+                data = response.json()
+                if data.get("status") == "success":
+                    isp = data.get("isp", "Unknown")
+                    asn = data.get("as", "Unknown")
+                    vpn_info = detect_vpn(public_ip, isp, asn)
+
+                    user_public_location = {
+                        "ip": public_ip,
+                        "country": data.get("country", "Unknown"),
+                        "city": data.get("city", "Unknown"),
+                        "lat": data.get("lat", 0),
+                        "lon": data.get("lon", 0),
+                        "isp": isp,
+                        "asn": asn,
+                        "is_vpn": vpn_info["is_vpn"],
+                        "vpn_provider": vpn_info["provider"],
+                    }
+                    print(
+                        f"[INFO] Your public location: {user_public_location['city']}, {user_public_location['country']}"
+                    )
+                    if vpn_info["is_vpn"]:
+                        print(
+                            f"[INFO] Your connection appears to be using {vpn_info['provider']}"
+                        )
+                    return user_public_location
+    except Exception as e:
+        print(f"[WARN] Error getting public location: {e}")
+
+    user_public_location = {
+        "ip": "Local",
+        "country": "Local Network",
+        "city": "Your Location",
+        "lat": 20,
+        "lon": 0,
+        "isp": "Local",
+        "asn": "N/A",
+        "is_vpn": False,
+        "vpn_provider": None,
+    }
+    return user_public_location
+
+
+def detect_vpn(ip, isp, asn):
+    """Enhanced multi-layered VPN detection using public databases.
+
+    Detection layers (in order of speed):
+    1. Cache lookup
+    2. ISP/Org keyword matching (fast, local)
+    3. ASN number matching against known VPN ASNs (fast, local)
+    4. IP range matching against X4BNet/Tor public lists (fast, local)
+    5. ip-api.com proxy/hosting fields (already fetched)
+    6. vpnapi.io public API (remote, rate-limited fallback)
+    """
+    # Check cache first
+    cache_key = f"{ip}_{isp}_{asn}"
+    if cache_key in VPN_CACHE:
+        return VPN_CACHE[cache_key]
+
+    detection_method = None
+
+    # Layer 1: ISP/Org keyword matching
+    check_text = f"{isp} {asn}".lower()
+    for vpn_name, keywords in VPN_PROVIDERS.items():
+        for keyword in keywords:
+            if keyword in check_text:
+                result = {"is_vpn": True, "provider": vpn_name, "method": "keyword"}
+                VPN_CACHE[cache_key] = result
+                print(f"[VPN-DETECTED] {vpn_name} detected for IP {ip} (keyword match)")
+                return result
+
+    # Layer 2: ASN number matching against known VPN ASNs
+    if asn and asn != "Unknown" and asn != "N/A":
+        # Extract ASN number (format: "AS12345 Organization Name")
+        asn_number = asn.split()[0] if asn else ""
+        if asn_number in VPN_ASN_DATABASE:
+            provider = VPN_ASN_DATABASE[asn_number]
+            result = {"is_vpn": True, "provider": provider, "method": "asn_database"}
+            VPN_CACHE[cache_key] = result
+            print(f"[VPN-DETECTED] {provider} detected for IP {ip} (ASN: {asn_number})")
+            return result
+
+    # Layer 3: Check against downloaded VPN IP range lists (X4BNet + Tor)
+    if check_ip_in_vpn_ranges(ip):
+        # Try to identify the provider from ISP if possible
+        provider = "VPN Service (IP Database Match)"
+        # Check if ISP name gives a hint
+        isp_lower = (isp or "").lower()
+        for vpn_name, keywords in VPN_PROVIDERS.items():
+            for keyword in keywords:
+                if keyword in isp_lower:
+                    provider = vpn_name
+                    break
+        result = {"is_vpn": True, "provider": provider, "method": "ip_database"}
+        VPN_CACHE[cache_key] = result
+        print(f"[VPN-DETECTED] {provider} detected for IP {ip} (X4BNet/Tor IP list)")
+        return result
+
+    # Layer 4: vpnapi.io public API (fallback, rate-limited)
+    # Only query for non-private IPs we haven't identified yet
+    if not ip.startswith(("10.", "172.", "192.168.", "127.")):
+        vpnapi_result = check_vpnapi_io(ip)
+        if vpnapi_result and vpnapi_result.get("is_vpn"):
+            result = {
+                "is_vpn": True,
+                "provider": vpnapi_result.get("provider", "VPN Service"),
+                "method": "vpnapi.io",
+            }
+            VPN_CACHE[cache_key] = result
+            print(
+                f"[VPN-DETECTED] {result['provider']} detected for IP {ip} (vpnapi.io)"
+            )
+            return result
+
+    # Not detected as VPN by any layer
+    result = {"is_vpn": False, "provider": None, "method": None}
+    VPN_CACHE[cache_key] = result
+    return result
+
+
+def get_ip_location_live(ip):
+    """Get geographic location for live capture IP"""
+    if ip in GEOIP_CACHE:
+        return GEOIP_CACHE[ip]
+
+    # Handle private IPs
+    if ip.startswith(("10.", "172.", "192.168.", "127.", "169.254.")):
+        fallback = get_user_public_location()
+        if fallback:
+            location = fallback.copy()
+            location["ip"] = ip
+            location["city"] = "Local Network"
+            location["isp"] = "Private IP"
+            location["asn"] = "N/A"
+            location["is_vpn"] = False
+            location["vpn_provider"] = None
+            import random
+
+            location["lat"] = location["lat"] + random.uniform(-0.5, 0.5)
+            location["lon"] = location["lon"] + random.uniform(-0.5, 0.5)
+            GEOIP_CACHE[ip] = location
+            return location
+        return None
+
+    try:
+        response = requests.get(
+            f"http://ip-api.com/json/{ip}?fields=status,country,city,lat,lon,isp,as,query,proxy,hosting",
+            timeout=2,
+        )
+        if response.status_code == 200:
+            data = response.json()
+            if data.get("status") == "success":
+                isp = data.get("isp", "Unknown")
+                asn = data.get("as", "Unknown")
+                is_proxy = data.get("proxy", False)
+                is_hosting = data.get("hosting", False)
+
+                # Enhanced multi-layer VPN detection
+                vpn_info = detect_vpn(ip, isp, asn)
+
+                # If ip-api flags as proxy but our detector missed it
+                if not vpn_info["is_vpn"] and is_proxy:
+                    vpn_info = {
+                        "is_vpn": True,
+                        "provider": f"Proxy/VPN ({isp})",
+                        "method": "ip-api-proxy",
+                    }
+                    VPN_CACHE[f"{ip}_{isp}_{asn}"] = vpn_info
+
+                location = {
+                    "ip": ip,
+                    "country": data.get("country", "Unknown"),
+                    "city": data.get("city", "Unknown"),
+                    "lat": data.get("lat", 0),
+                    "lon": data.get("lon", 0),
+                    "isp": isp,
+                    "asn": asn,
+                    "is_vpn": vpn_info["is_vpn"],
+                    "vpn_provider": vpn_info.get("provider"),
+                    "vpn_method": vpn_info.get("method"),
+                    "is_hosting": is_hosting,
+                }
+                GEOIP_CACHE[ip] = location
+                return location
+    except Exception as e:
+        print(f"[WARN] Error getting location for {ip}: {e}")
+
+    return None
+
+
+# ============================================================================
+# LIVE PACKET CAPTURE (FROM PACKETFLOW)
+# ============================================================================
+
+
+def packet_callback(packet):
+    """Process captured packets in real-time (headers only for performance)"""
+    global live_stats, captured_packets
+
+    # Store packet headers only (payload ignored for performance)
+    captured_packets.append(packet)
+
+    # Debug: print first packet captured
+    if live_stats["total_packets"] == 0:
+        print("[SUCCESS] First packet captured! Capture is working.")
+
+    if IP in packet:
+        src_ip = packet[IP].src
+        dst_ip = packet[IP].dst
+        protocol = "TCP" if TCP in packet else "UDP" if UDP in packet else "OTHER"
+        packet_size = len(packet)
+
+        # Update enhanced stats
+        live_stats["total_packets"] += 1
+        live_stats["total_bytes"] += packet_size
+        live_stats["unique_ips"].add(src_ip)
+        live_stats["unique_ips"].add(dst_ip)
+        live_stats["unique_src_ips"].add(src_ip)
+        live_stats["unique_dst_ips"].add(dst_ip)
+        live_stats["protocols"][protocol] += 1
+        live_stats["top_talkers"][src_ip] += packet_size
+
+        if protocol == "TCP":
+            live_stats["tcp_packets"] += 1
+            src_port = packet[TCP].sport
+            dst_port = packet[TCP].dport
+            flags = packet[TCP].flags
+            seq = packet[TCP].seq
+            ack = packet[TCP].ack
+            live_stats["ports"][dst_port] += 1
+        elif protocol == "UDP":
+            live_stats["udp_packets"] += 1
+            src_port = packet[UDP].sport
+            dst_port = packet[UDP].dport
+            flags = None
+            seq = None
+            ack = None
+            live_stats["ports"][dst_port] += 1
+        else:
+            return
+
+        # Create connection key
+        conn_key = f"{src_ip}:{src_port}->{dst_ip}:{dst_port}"
+        if conn_key not in live_stats["connections"]:
+            live_stats["connections"][conn_key] = 0
+        live_stats["connections"][conn_key] += 1
+
+        # Get geolocation
+        src_loc = get_ip_location_live(src_ip)
+        dst_loc = get_ip_location_live(dst_ip)
+
+        # Only process if both locations are valid
+        if src_loc and dst_loc:
+            # Check for VPN usage
+            vpn_detected = False
+
+            if src_loc.get("is_vpn"):
+                vpn_detected = True
+                live_stats["vpn_ips"].add(src_ip)
+                vpn_ips.add(src_ip)
+                if src_ip not in live_stats["vpn_details"]:
+                    live_stats["vpn_details"][src_ip] = {
+                        "ip": src_ip,
+                        "provider": src_loc.get("vpn_provider", "Unknown"),
+                        "isp": src_loc.get("isp", "Unknown"),
+                        "country": src_loc.get("country", "Unknown"),
+                        "city": src_loc.get("city", "Unknown"),
+                        "direction": "source",
+                        "peer_ip": dst_ip,
+                        "method": src_loc.get("vpn_method", "keyword"),
+                    }
+                    print(
+                        f"[VPN-ALERT] Source IP {src_ip} using {src_loc.get('vpn_provider')} (via {src_loc.get('vpn_method', 'keyword')})"
+                    )
+
+            if dst_loc.get("is_vpn"):
+                vpn_detected = True
+                live_stats["vpn_ips"].add(dst_ip)
+                vpn_ips.add(dst_ip)
+                if dst_ip not in live_stats["vpn_details"]:
+                    live_stats["vpn_details"][dst_ip] = {
+                        "ip": dst_ip,
+                        "provider": dst_loc.get("vpn_provider", "Unknown"),
+                        "isp": dst_loc.get("isp", "Unknown"),
+                        "country": dst_loc.get("country", "Unknown"),
+                        "city": dst_loc.get("city", "Unknown"),
+                        "direction": "destination",
+                        "peer_ip": src_ip,
+                        "method": dst_loc.get("vpn_method", "keyword"),
+                    }
+                    print(
+                        f"[VPN-ALERT] Destination IP {dst_ip} using {dst_loc.get('vpn_provider')} (via {dst_loc.get('vpn_method', 'keyword')})"
+                    )
+
+            packet_data = {
+                "timestamp": time.time(),
+                "src_ip": src_ip,
+                "dst_ip": dst_ip,
+                "src_port": src_port,
+                "dst_port": dst_port,
+                "protocol": protocol,
+                "src_location": src_loc,
+                "dst_location": dst_loc,
+                "size": packet_size,
+                "flags": str(flags) if flags else None,
+                "seq": seq,
+                "ack": ack,
+                "ttl": packet[IP].ttl if IP in packet else None,
+                "id": packet[IP].id if IP in packet else None,
+                "vpn_detected": vpn_detected,
+            }
+
+            packet_history.append(packet_data)
+
+            # Emit to all connected clients via WebSocket
+            socketio.emit("new_packet", packet_data)
+
+
+# ============================================================================
+# SWITCH MONITORING - Per-device VPN detection for all switch traffic
+# ============================================================================
+
+
+def is_internal_ip(ip_str):
+    """Check if an IP belongs to the monitored internal subnet(s)"""
+    if not SWITCH_SUBNET:
+        # Default: treat all private IPs as internal
+        return is_private_ip(ip_str)
+    try:
+        ip = ipaddress.ip_address(ip_str)
+        subnet = ipaddress.ip_network(SWITCH_SUBNET, strict=False)
+        return ip in subnet
+    except ValueError:
+        return False
+
+
+def detect_vpn_protocol_heuristic(packet, src_port, dst_port, protocol):
+    """Detect VPN usage by protocol/port heuristics (DPI-lite).
+    This catches VPN traffic even before IP reputation lookups.
+    """
+    hints = []
+
+    # Check known VPN ports
+    for port in [src_port, dst_port]:
+        if port in VPN_PROTOCOL_PORTS:
+            # 443 is too common - only flag if combined with other signals
+            if port != 443 and port != 53:
+                hints.append({"port": port, "protocol_hint": VPN_PROTOCOL_PORTS[port]})
+            elif port == 53 and protocol == "TCP":
+                # DNS over TCP with large packets = possible DNS tunnel
+                if len(packet) > 200:
+                    hints.append(
+                        {"port": port, "protocol_hint": "DNS Tunnel (suspicious)"}
+                    )
+
+    # WireGuard heuristic: UDP with specific packet sizes
+    if protocol == "UDP" and dst_port >= 51820 and dst_port <= 51830:
+        hints.append({"port": dst_port, "protocol_hint": "WireGuard"})
+
+    # IPSec ESP: protocol number 50
+    if IP in packet and packet[IP].proto == 50:
+        hints.append({"port": 0, "protocol_hint": "IPSec ESP"})
+
+    # IKE: UDP port 500 or 4500
+    if protocol == "UDP" and dst_port in [500, 4500]:
+        hints.append({"port": dst_port, "protocol_hint": VPN_PROTOCOL_PORTS[dst_port]})
+
+    # OpenVPN heuristic: UDP/TCP 1194, or specific payload signature
+    if dst_port == 1194 or src_port == 1194:
+        hints.append({"port": 1194, "protocol_hint": "OpenVPN"})
+
+    return hints
+
+
+def switch_packet_callback(packet):
+    """Process packets captured from switch mirror port.
+    Tracks per-device activity and detects VPN usage per internal device.
+    """
+    global switch_devices, switch_vpn_alerts
+
+    if IP not in packet:
+        return
+
+    src_ip = packet[IP].src
+    dst_ip = packet[IP].dst
+    protocol = "TCP" if TCP in packet else "UDP" if UDP in packet else "OTHER"
+    packet_size = len(packet)
+    now = time.time()
+
+    if protocol == "TCP" and TCP in packet:
+        src_port = packet[TCP].sport
+        dst_port = packet[TCP].dport
+    elif protocol == "UDP" and UDP in packet:
+        src_port = packet[UDP].sport
+        dst_port = packet[UDP].dport
+    else:
+        src_port = 0
+        dst_port = 0
+
+    # Determine which IP is internal (the monitored device)
+    src_is_internal = is_internal_ip(src_ip)
+    dst_is_internal = is_internal_ip(dst_ip)
+
+    if not src_is_internal and not dst_is_internal:
+        return  # Neither end is on our network - skip
+
+    # Identify the internal device and the external endpoint
+    if src_is_internal:
+        internal_ip = src_ip
+        external_ip = dst_ip
+        direction = "outbound"
+    else:
+        internal_ip = dst_ip
+        external_ip = src_ip
+        direction = "inbound"
+
+    # Skip if external IP is also internal (internal-to-internal traffic)
+    if is_internal_ip(external_ip):
+        # Still track device activity
+        with switch_device_lock:
+            if internal_ip not in switch_devices:
+                switch_devices[internal_ip] = _new_device_entry(internal_ip, now)
+            switch_devices[internal_ip]["last_seen"] = now
+            switch_devices[internal_ip]["total_packets"] += 1
+            switch_devices[internal_ip]["total_bytes"] += packet_size
+            switch_devices[internal_ip]["internal_traffic_bytes"] += packet_size
+        return
+
+    # Update device entry
+    with switch_device_lock:
+        if internal_ip not in switch_devices:
+            switch_devices[internal_ip] = _new_device_entry(internal_ip, now)
+
+        dev = switch_devices[internal_ip]
+        dev["last_seen"] = now
+        dev["total_packets"] += 1
+        dev["total_bytes"] += packet_size
+        dev["protocols"][protocol] = dev["protocols"].get(protocol, 0) + 1
+
+        # Track unique external IPs this device communicates with
+        if external_ip not in dev["external_ips"]:
+            dev["external_ips"][external_ip] = {
+                "packets": 0,
+                "bytes": 0,
+                "first_seen": now,
+            }
+        dev["external_ips"][external_ip]["packets"] += 1
+        dev["external_ips"][external_ip]["bytes"] += packet_size
+
+    # --- VPN Detection for this device ---
+
+    # 1. Protocol/port heuristics (instant, no network calls)
+    vpn_hints = detect_vpn_protocol_heuristic(packet, src_port, dst_port, protocol)
+
+    # 2. IP reputation check (uses cache, occasional API call)
+    vpn_by_ip = False
+    vpn_provider = None
+    vpn_method = None
+
+    # Only do expensive lookups for external IPs we haven't checked
+    if not is_private_ip(external_ip):
+        ext_loc = get_ip_location_live(external_ip)
+        if ext_loc and ext_loc.get("is_vpn"):
+            vpn_by_ip = True
+            vpn_provider = ext_loc.get("vpn_provider", "Unknown VPN")
+            vpn_method = ext_loc.get("vpn_method", "ip_lookup")
+
+    # Combine heuristic + IP reputation results
+    is_vpn_traffic = vpn_by_ip or len(vpn_hints) > 0
+
+    if is_vpn_traffic:
+        with switch_device_lock:
+            dev = switch_devices[internal_ip]
+            dev["vpn_detected"] = True
+            dev["vpn_packet_count"] = dev.get("vpn_packet_count", 0) + 1
+            dev["vpn_bytes"] = dev.get("vpn_bytes", 0) + packet_size
+
+            # Determine provider
+            if vpn_by_ip and vpn_provider:
+                provider = vpn_provider
+                method = vpn_method
+            elif vpn_hints:
+                provider = vpn_hints[0]["protocol_hint"]
+                method = f"port_{vpn_hints[0]['port']}"
+            else:
+                provider = "Unknown VPN"
+                method = "heuristic"
+
+            # Track VPN connections per device
+            vpn_conn_key = f"{external_ip}:{dst_port}"
+            if "vpn_connections" not in dev:
+                dev["vpn_connections"] = {}
+            if vpn_conn_key not in dev["vpn_connections"]:
+                dev["vpn_connections"][vpn_conn_key] = {
+                    "external_ip": external_ip,
+                    "port": dst_port,
+                    "provider": provider,
+                    "method": method,
+                    "first_seen": now,
+                    "last_seen": now,
+                    "packets": 0,
+                    "bytes": 0,
+                }
+
+                # New VPN connection detected - create alert!
+                alert = {
+                    "id": len(switch_vpn_alerts) + 1,
+                    "timestamp": now,
+                    "timestamp_str": datetime.fromtimestamp(now).strftime(
+                        "%Y-%m-%d %H:%M:%S"
+                    ),
+                    "device_ip": internal_ip,
+                    "vpn_server_ip": external_ip,
+                    "port": dst_port,
+                    "protocol": protocol,
+                    "provider": provider,
+                    "method": method,
+                    "direction": direction,
+                    "severity": "HIGH" if vpn_by_ip else "MEDIUM",
+                }
+                switch_vpn_alerts.append(alert)
+
+                # Keep only last 500 alerts
+                if len(switch_vpn_alerts) > 500:
+                    switch_vpn_alerts = switch_vpn_alerts[-500:]
+
+                print(
+                    f"[SWITCH-VPN-ALERT] Device {internal_ip} -> VPN server {external_ip}:{dst_port} ({provider}) via {method}"
+                )
+
+                # Emit real-time alert via WebSocket
+                socketio.emit("switch_vpn_alert", alert)
+
+            dev["vpn_connections"][vpn_conn_key]["last_seen"] = now
+            dev["vpn_connections"][vpn_conn_key]["packets"] += 1
+            dev["vpn_connections"][vpn_conn_key]["bytes"] += packet_size
+
+    # Emit live-capture-style packet for real-time map + packet table (every packet)
+    if not is_private_ip(external_ip):
+        ext_loc = GEOIP_CACHE.get(external_ip)
+        if ext_loc and ext_loc.get("lat"):
+            user_loc = get_user_public_location()
+            if user_loc:
+                import random as _rnd
+
+                # Build location objects matching live capture shape
+                internal_loc = {
+                    "lat": user_loc["lat"] + _rnd.uniform(-0.3, 0.3),
+                    "lon": user_loc["lon"] + _rnd.uniform(-0.3, 0.3),
+                    "ip": internal_ip,
+                    "city": user_loc.get("city", ""),
+                    "country": user_loc.get("country", ""),
+                    "isp": "Internal",
+                    "is_vpn": False,
+                }
+                external_loc = {
+                    "lat": ext_loc["lat"],
+                    "lon": ext_loc["lon"],
+                    "ip": external_ip,
+                    "city": ext_loc.get("city", ""),
+                    "country": ext_loc.get("country", ""),
+                    "isp": ext_loc.get("isp", ""),
+                    "is_vpn": ext_loc.get("is_vpn", False),
+                    "vpn_provider": ext_loc.get("vpn_provider"),
+                }
+
+                if direction == "outbound":
+                    src_loc_data = internal_loc
+                    dst_loc_data = external_loc
+                else:
+                    src_loc_data = external_loc
+                    dst_loc_data = internal_loc
+
+                packet_data = {
+                    "timestamp": now,
+                    "src_ip": src_ip,
+                    "dst_ip": dst_ip,
+                    "src_port": src_port,
+                    "dst_port": dst_port,
+                    "protocol": protocol,
+                    "src_location": src_loc_data,
+                    "dst_location": dst_loc_data,
+                    "size": packet_size,
+                    "flags": (str(packet[TCP].flags) if TCP in packet else None),
+                    "seq": packet[TCP].seq if TCP in packet else None,
+                    "ack": packet[TCP].ack if TCP in packet else None,
+                    "ttl": packet[IP].ttl,
+                    "id": packet[IP].id,
+                    "vpn_detected": is_vpn_traffic,
+                    "device_ip": internal_ip,
+                    "direction": direction,
+                }
+
+                socketio.emit("switch_new_packet", packet_data)
+
+    # Emit device update periodically (every 50 packets per device to reduce noise)
+    with switch_device_lock:
+        dev = switch_devices[internal_ip]
+        if dev["total_packets"] % 50 == 0:
+            socketio.emit("switch_device_update", _sanitize_device(internal_ip, dev))
+
+
+def _new_device_entry(ip, now):
+    """Create a new device tracking entry"""
+    return {
+        "ip": ip,
+        "first_seen": now,
+        "last_seen": now,
+        "total_packets": 0,
+        "total_bytes": 0,
+        "internal_traffic_bytes": 0,
+        "protocols": {},
+        "external_ips": {},
+        "vpn_detected": False,
+        "vpn_packet_count": 0,
+        "vpn_bytes": 0,
+        "vpn_connections": {},
+    }
+
+
+def _sanitize_device(ip, dev):
+    """Create a JSON-safe summary of a device for API/WebSocket responses"""
+    vpn_conns = []
+    for key, conn_info in dev.get("vpn_connections", {}).items():
+        # Get geo for VPN server IP
+        geo = GEOIP_CACHE.get(conn_info["external_ip"])
+        vpn_conns.append(
+            {
+                "external_ip": conn_info["external_ip"],
+                "port": conn_info["port"],
+                "provider": conn_info["provider"],
+                "method": conn_info["method"],
+                "packets": conn_info["packets"],
+                "bytes": conn_info["bytes"],
+                "first_seen": conn_info["first_seen"],
+                "last_seen": conn_info["last_seen"],
+                "geo": (
+                    {
+                        "lat": geo["lat"],
+                        "lon": geo["lon"],
+                        "city": geo.get("city", ""),
+                        "country": geo.get("country", ""),
+                        "isp": geo.get("isp", ""),
+                    }
+                    if geo and geo.get("lat")
+                    else None
+                ),
+            }
+        )
+
+    # Collect geo for top external IPs
+    ext_geo_samples = []
+    for ext_ip, info in list(dev.get("external_ips", {}).items())[:30]:
+        geo = GEOIP_CACHE.get(ext_ip)
+        if geo and geo.get("lat"):
+            ext_geo_samples.append(
+                {
+                    "ip": ext_ip,
+                    "lat": geo["lat"],
+                    "lon": geo["lon"],
+                    "city": geo.get("city", ""),
+                    "country": geo.get("country", ""),
+                    "isp": geo.get("isp", ""),
+                    "is_vpn": geo.get("is_vpn", False),
+                    "vpn_provider": geo.get("vpn_provider"),
+                    "packets": info["packets"],
+                    "bytes": info["bytes"],
+                }
+            )
+
+    return {
+        "ip": ip,
+        "first_seen": dev["first_seen"],
+        "last_seen": dev["last_seen"],
+        "total_packets": dev["total_packets"],
+        "total_bytes": dev["total_bytes"],
+        "internal_traffic_bytes": dev.get("internal_traffic_bytes", 0),
+        "protocols": dev["protocols"],
+        "external_ip_count": len(dev["external_ips"]),
+        "vpn_detected": dev["vpn_detected"],
+        "vpn_packet_count": dev.get("vpn_packet_count", 0),
+        "vpn_bytes": dev.get("vpn_bytes", 0),
+        "vpn_connections": vpn_conns,
+        "ext_geo": ext_geo_samples,
+    }
+
+
+def start_switch_monitor():
+    """Start switch monitoring in a separate thread"""
+    global SWITCH_MONITOR_RUNNING, switch_devices, switch_vpn_alerts
+
+    SWITCH_MONITOR_RUNNING = True
+    switch_devices = {}
+    switch_vpn_alerts = []
+
+    iface = SWITCH_INTERFACE
+    print(f"[SWITCH] Starting switch monitor on interface: {iface or 'ALL'}")
+    print(f"[SWITCH] Monitoring subnet: {SWITCH_SUBNET or 'all private ranges'}")
+    print(f"[SWITCH] Promiscuous mode enabled for switch traffic capture")
+    print(f"[SWITCH] Make sure port mirroring (SPAN) is configured on your switch!")
+
+    # Initialize VPN databases
+    if not VPN_IP_RANGES_LOADED:
+        try:
+            download_vpn_ip_lists()
+        except:
+            pass
+
+    try:
+        try:
+            sniff(
+                iface=iface,
+                prn=switch_packet_callback,
+                filter="ip and (tcp or udp)",
+                store=False,
+                snaplen=CAPTURE_SNAPLEN,
+                stop_filter=lambda x: not SWITCH_MONITOR_RUNNING,
+            )
+        except TypeError:
+            print("[WARN] snaplen not supported, capturing full packets")
+            sniff(
+                iface=iface,
+                prn=switch_packet_callback,
+                filter="ip and (tcp or udp)",
+                store=False,
+                stop_filter=lambda x: not SWITCH_MONITOR_RUNNING,
+            )
+    except PermissionError:
+        print("[ERROR] Permission denied! Run as Administrator for switch monitoring")
+        SWITCH_MONITOR_RUNNING = False
+    except Exception as e:
+        print(f"[ERROR] Switch monitoring error: {e}")
+        SWITCH_MONITOR_RUNNING = False
+
+
+def start_capture():
+    """Start packet capture in a separate thread"""
+    global capture_running, capture_session_name, captured_packets
+    capture_running = True
+    live_stats["start_time"] = time.time()
+
+    # Generate session name
+    capture_session_name = f"live_capture_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    captured_packets = []  # Clear previous packets
+
+    print(
+        f"[INFO] Starting live packet capture on interface: {CAPTURE_INTERFACE or 'ALL'}"
+    )
+    print(f"[INFO] Session name: {capture_session_name}")
+
+    # Initialize user location
+    get_user_public_location()
+
+    print(
+        f"[INFO] Capturing headers only ({CAPTURE_SNAPLEN} bytes) for optimal performance"
+    )
+    print("[INFO] Waiting for packets... (Make sure you're running as Administrator)")
+
+    try:
+        # Try with snaplen first
+        try:
+            sniff(
+                iface=CAPTURE_INTERFACE,
+                prn=packet_callback,
+                filter="ip and (tcp or udp)",
+                store=False,
+                snaplen=CAPTURE_SNAPLEN,  # Capture only headers (Ethernet + IP + TCP/UDP), ignore payload
+                stop_filter=lambda x: not capture_running,
+            )
+        except TypeError:
+            # snaplen not supported on this platform, fallback without it
+            print("[WARN] snaplen parameter not supported, capturing full packets")
+            sniff(
+                iface=CAPTURE_INTERFACE,
+                prn=packet_callback,
+                filter="ip and (tcp or udp)",
+                store=False,
+                stop_filter=lambda x: not capture_running,
+            )
+    except PermissionError:
+        print(
+            "[ERROR] Permission denied! Run as Administrator (Windows) or with sudo (Linux)"
+        )
+        capture_running = False
+    except Exception as e:
+        print(f"[ERROR] Error during packet capture: {e}")
+        print("[ERROR] Make sure you have Npcap installed: https://npcap.com/")
+        capture_running = False
+
+
+# ============================================================================
+# API ROUTES - STATIC FILE SERVING
+# ============================================================================
+
+
+@app.route("/")
+def index():
+    return send_from_directory("static", "index.html")
+
+
+# ============================================================================
+# API ROUTES - PCAP ANALYSIS (FROM 5G-PACKETSENSE)
+# ============================================================================
+
+
+@app.route("/api/mode")
+def get_mode():
+    """Return current operation mode"""
+    return jsonify(
+        {
+            "has_parquet": conn is not None,
+            "live_capture": capture_running,
+            "parquet_path": parquet_path,
+        }
+    )
+
+
+@app.route("/api/local_ips")
+def get_local_ips():
+    """Return local IP addresses of this machine"""
+    local_ips = get_local_ip_addresses()
+    return jsonify({"local_ips": local_ips})
+
+
+@app.route("/api/flows", methods=["GET"])
+def get_flows():
+    """Get packet flows from loaded PCAP"""
+    if not conn:
+        return jsonify({"error": "No PCAP loaded. Use /api/load_parquet first."}), 400
+
+    limit = int(request.args.get("limit", 100))
+    protocol = request.args.get("protocol", None)
+    min_packets = int(request.args.get("min_packets", 1))
+    start_time = request.args.get("start")
+    end_time = request.args.get("end")
+
+    sql = f"""
+        SELECT 
+            {COLS['src']} as src_ip,
+            {COLS['dst']} as dst_ip,
+            COUNT(*) as packet_count,
+            COALESCE(SUM(TRY_CAST({COLS['len']} AS INTEGER)), 0) as total_bytes,
+            COALESCE(AVG(TRY_CAST({COLS['len']} AS INTEGER)), 0) as avg_packet_size
+        FROM packets
+        WHERE {COLS['src']} IS NOT NULL 
+          AND {COLS['dst']} IS NOT NULL
+    """
+
+    if start_time and end_time:
+        sql += f" AND {COLS['time']} BETWEEN {start_time} AND {end_time}"
+
+    if protocol:
+        sql += f" AND {COLS['proto']} LIKE '%{protocol}%'"
+
+    sql += f"""
+        GROUP BY src_ip, dst_ip
+        HAVING COUNT(*) >= {min_packets}
+        ORDER BY packet_count DESC
+        LIMIT {limit}
+    """
+
+    try:
+        print(f"[DEBUG] Executing flows query: {sql}")
+        result = conn.execute(sql).fetchall()
+        flows = []
+        skipped_count = 0
+        for row in result:
+            src_ip, dst_ip, packet_count, total_bytes, avg_size = row
+            src_geo = get_geolocation(src_ip)
+            dst_geo = get_geolocation(dst_ip)
+
+            # Skip flows where either location is unknown
+            if not src_geo or not dst_geo:
+                skipped_count += 1
+                continue
+
+            flows.append(
+                {
+                    "src": {"ip": src_ip, **src_geo},
+                    "dst": {"ip": dst_ip, **dst_geo},
+                    "stats": {
+                        "packet_count": int(packet_count),
+                        "total_bytes": int(total_bytes) if total_bytes else 0,
+                        "avg_packet_size": float(avg_size) if avg_size else 0,
+                    },
+                }
+            )
+
+        if skipped_count > 0:
+            print(f"[INFO] Skipped {skipped_count} flows with unknown locations")
+
+        return jsonify({"flows": flows, "total": len(flows), "skipped": skipped_count})
+    except Exception as e:
+        print(f"[ERROR] Error flows: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/stats", methods=["GET"])
+def get_stats():
+    """Get packet statistics"""
+    if not conn:
+        return jsonify({"error": "No PCAP loaded"}), 400
+
+    try:
+        total = conn.execute("SELECT COUNT(*) FROM packets").fetchone()[0]
+        u_src = conn.execute(
+            f"SELECT COUNT(DISTINCT {COLS['src']}) FROM packets"
+        ).fetchone()[0]
+        u_dst = conn.execute(
+            f"SELECT COUNT(DISTINCT {COLS['dst']}) FROM packets"
+        ).fetchone()[0]
+
+        protos = conn.execute(
+            f"""
+            SELECT {COLS['proto']}, COUNT(*) as count FROM packets
+            WHERE {COLS['proto']} IS NOT NULL GROUP BY 1 ORDER BY 2 DESC LIMIT 10
+        """
+        ).fetchall()
+
+        # Top talkers by packet count
+        top_talkers = conn.execute(
+            f"""
+            SELECT ip, SUM(packets) as total_packets, SUM(bytes) as total_bytes
+            FROM (
+                SELECT {COLS['src']} as ip, COUNT(*) as packets, 
+                       COALESCE(SUM(TRY_CAST({COLS['len']} AS INTEGER)), 0) as bytes
+                FROM packets WHERE {COLS['src']} IS NOT NULL
+                GROUP BY {COLS['src']}
+                UNION ALL
+                SELECT {COLS['dst']} as ip, COUNT(*) as packets,
+                       COALESCE(SUM(TRY_CAST({COLS['len']} AS INTEGER)), 0) as bytes
+                FROM packets WHERE {COLS['dst']} IS NOT NULL
+                GROUP BY {COLS['dst']}
+            )
+            GROUP BY ip
+            ORDER BY total_bytes DESC
+            LIMIT 10
+        """
+        ).fetchall()
+
+        # Top ports by packet count (src_port and dst_port are used by both TCP and UDP)
+        top_src_ports = conn.execute(
+            f"""
+            SELECT "src_port", COUNT(*) as count
+            FROM packets
+            WHERE "src_port" IS NOT NULL
+            GROUP BY "src_port"
+            ORDER BY count DESC
+            LIMIT 5
+        """
+        ).fetchall()
+
+        top_dst_ports = conn.execute(
+            f"""
+            SELECT "dst_port", COUNT(*) as count
+            FROM packets
+            WHERE "dst_port" IS NOT NULL
+            GROUP BY "dst_port"
+            ORDER BY count DESC
+            LIMIT 5
+        """
+        ).fetchall()
+
+        # Total bytes and average packet size
+        total_bytes = conn.execute(
+            f"SELECT COALESCE(SUM(TRY_CAST({COLS['len']} AS INTEGER)), 0) FROM packets"
+        ).fetchone()[0]
+
+        avg_packet_size = conn.execute(
+            f"SELECT COALESCE(AVG(TRY_CAST({COLS['len']} AS INTEGER)), 0) FROM packets"
+        ).fetchone()[0]
+
+        # Time range
+        time_range = conn.execute(
+            f"SELECT MIN({COLS['time']}), MAX({COLS['time']}) FROM packets"
+        ).fetchone()
+
+        duration = (
+            time_range[1] - time_range[0] if time_range[0] and time_range[1] else 0
+        )
+        packet_rate = total / duration if duration > 0 else 0
+
+        # Count IPs with unknown locations
+        all_ips = conn.execute(
+            f"""
+            SELECT DISTINCT ip FROM (
+                SELECT {COLS['src']} as ip FROM packets WHERE {COLS['src']} IS NOT NULL
+                UNION
+                SELECT {COLS['dst']} as ip FROM packets WHERE {COLS['dst']} IS NOT NULL
+            )
+            """
+        ).fetchall()
+
+        unknown_location_count = 0
+        vpn_ip_count = 0
+        vpn_detail_list = []
+        for (ip,) in all_ips:
+            geo = get_geolocation(ip)
+            if geo is None:
+                unknown_location_count += 1
+            elif geo.get("is_vpn"):
+                vpn_ip_count += 1
+                vpn_detail_list.append(
+                    {
+                        "ip": ip,
+                        "provider": geo.get("vpn_provider", "Unknown"),
+                        "isp": geo.get("isp", "Unknown"),
+                        "country": geo.get("country", "Unknown"),
+                        "city": geo.get("city", "Unknown"),
+                        "method": geo.get("vpn_method", "keyword"),
+                    }
+                )
+
+        return jsonify(
+            {
+                "total_packets": total,
+                "unique_src_ips": u_src,
+                "unique_dst_ips": u_dst,
+                "protocols": [{"name": p[0], "count": p[1]} for p in protos],
+                "top_talkers": [
+                    {"ip": t[0], "packets": int(t[1]), "bytes": int(t[2])}
+                    for t in top_talkers
+                ],
+                "top_src_ports": [
+                    {"port": int(p[0]), "count": int(p[1])} for p in top_src_ports
+                ],
+                "top_dst_ports": [
+                    {"port": int(p[0]), "count": int(p[1])} for p in top_dst_ports
+                ],
+                "total_bytes": int(total_bytes),
+                "avg_packet_size": float(avg_packet_size),
+                "duration": float(duration),
+                "packet_rate": float(packet_rate),
+                "unknown_locations": unknown_location_count,
+                "vpn_ips_count": vpn_ip_count,
+                "vpn_ips": list(vpn_ips)[:10],
+                "vpn_details": vpn_detail_list[:10],
+            }
+        )
+    except Exception as e:
+        print(f"[ERROR] Stats error: {e}")
+        import traceback
+
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/time_range", methods=["GET"])
+def get_time_range():
+    """Get time range from loaded PCAP"""
+    if not conn:
+        return jsonify({"error": "No PCAP loaded"}), 400
+
+    try:
+        result = conn.execute(
+            f"SELECT MIN({COLS['time']}), MAX({COLS['time']}) FROM packets WHERE {COLS['time']} IS NOT NULL"
+        ).fetchone()
+        min_time = result[0]
+        max_time = result[1]
+
+        if min_time is None or max_time is None:
+            return jsonify({"min": 0, "max": 0})
+
+        if isinstance(min_time, str):
+            min_time = float(min_time)
+        if isinstance(max_time, str):
+            max_time = float(max_time)
+
+        return jsonify({"min": min_time, "max": max_time})
+    except Exception as e:
+        print(f"[ERROR] Error time_range: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/flow_details", methods=["GET"])
+def get_flow_details():
+    """Get detailed packet info for a specific flow"""
+    if not conn:
+        return jsonify({"error": "No PCAP loaded"}), 400
+
+    src = request.args.get("src")
+    dst = request.args.get("dst")
+    limit = int(request.args.get("limit", 50))
+
+    try:
+        sql = f"""
+            SELECT 
+                {COLS['number']},
+                {COLS['time']},
+                {COLS['len']},
+                {COLS['proto']}
+            FROM packets
+            WHERE {COLS['src']} = '{src}' AND {COLS['dst']} = '{dst}'
+            ORDER BY {COLS['time']}
+            LIMIT {limit}
+        """
+        result = conn.execute(sql).fetchall()
+        packets = []
+        for row in result:
+            time_val = row[1]
+            if isinstance(time_val, str):
+                try:
+                    time_val = float(time_val)
+                except (ValueError, TypeError):
+                    time_val = 0
+            packets.append(
+                {
+                    "number": row[0],
+                    "time": time_val,
+                    "length": row[2],
+                    "protocols": row[3],
+                }
+            )
+        return jsonify({"packets": packets})
+    except Exception as e:
+        print(f"[ERROR] Error DPI: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+# ============================================================================
+# API ROUTES - SWITCH MONITORING
+# ============================================================================
+
+
+@app.route("/api/switch/interfaces")
+def get_switch_interfaces():
+    """List available network interfaces for switch monitoring.
+    Works on Windows, Linux, and macOS by using platform-specific Scapy APIs.
+    """
+    import platform
+
+    result = []
+
+    try:
+        if platform.system() == "Windows":
+            from scapy.arch.windows import get_windows_if_list
+
+            ifaces = get_windows_if_list()
+
+            # Keywords to skip (virtual/filter/tunneling adapters)
+            skip_keywords = [
+                "WFP",
+                "Filter",
+                "Pseudo",
+                "Tunneling",
+                "6to4",
+                "SSTP",
+                "IKEv2",
+                "L2TP",
+                "PPTP",
+                "PPPOE",
+                "WAN Miniport",
+                "QoS Packet Scheduler",
+                "Npcap Packet Driver",
+                "Kernel Debug",
+                "Wi-Fi Direct",
+                "Bluetooth",
+                "Microsoft IP-HTTPS",
+                "Teredo",
+            ]
+
+            for iface in ifaces:
+                name = iface.get("name", "")
+                desc = iface.get("description", "")
+                ips = iface.get("ips", [])
+                combined = f"{name} {desc}"
+
+                if any(skip.lower() in combined.lower() for skip in skip_keywords):
+                    continue
+
+                ipv4s = [ip for ip in ips if "." in ip and not ip.startswith("169.254")]
+                is_ethernet = any(
+                    kw in combined.lower()
+                    for kw in [
+                        "ethernet",
+                        "realtek",
+                        "intel i2",
+                        "broadcom",
+                        "usb gbe",
+                        "gigabit",
+                    ]
+                )
+                is_wifi = any(
+                    kw in combined.lower()
+                    for kw in ["wi-fi", "wifi", "wireless", "wlan", "killer"]
+                )
+
+                if not ipv4s and not is_ethernet and not is_wifi:
+                    continue
+
+                result.append(
+                    {
+                        "name": name,
+                        "description": desc,
+                        "ips": ips,
+                        "ipv4": ipv4s,
+                        "is_ethernet": is_ethernet,
+                        "is_wifi": is_wifi,
+                    }
+                )
+
+        else:
+            # Linux / macOS: use generic Scapy interface list + netifaces if available
+            from scapy.all import get_if_list
+
+            ifaces = get_if_list()
+
+            # Skip loopback and virtual interfaces on Linux/macOS
+            skip_prefixes = ("lo", "docker", "br-", "veth", "virbr", "vmnet")
+
+            for iface_name in ifaces:
+                if iface_name.startswith(skip_prefixes):
+                    continue
+
+                is_ethernet = any(
+                    kw in iface_name.lower() for kw in ["eth", "en", "enp", "ens"]
+                )
+                is_wifi = any(kw in iface_name.lower() for kw in ["wl", "wlan", "wifi"])
+
+                # Try to get IP addresses via socket
+                ipv4s = []
+                try:
+                    import fcntl
+                    import struct
+
+                    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    ip_addr = socket.inet_ntoa(
+                        fcntl.ioctl(
+                            s.fileno(),
+                            0x8915,  # SIOCGIFADDR
+                            struct.pack("256s", iface_name[:15].encode("utf-8")),
+                        )[20:24]
+                    )
+                    if not ip_addr.startswith("169.254"):
+                        ipv4s.append(ip_addr)
+                except Exception:
+                    pass
+
+                result.append(
+                    {
+                        "name": iface_name,
+                        "description": iface_name,
+                        "ips": ipv4s,
+                        "ipv4": ipv4s,
+                        "is_ethernet": is_ethernet,
+                        "is_wifi": is_wifi,
+                    }
+                )
+
+        # Sort: ethernet first, then wifi, then others
+        result.sort(
+            key=lambda x: (not x["is_ethernet"], not x.get("is_wifi", False), x["name"])
+        )
+
+        return jsonify({"interfaces": result})
+
+    except Exception as e:
+        # Final fallback: basic interface list
+        try:
+            from scapy.all import get_if_list
+
+            ifaces = get_if_list()
+            return jsonify(
+                {
+                    "interfaces": [
+                        {
+                            "name": i,
+                            "description": i,
+                            "ips": [],
+                            "ipv4": [],
+                            "is_ethernet": False,
+                            "is_wifi": False,
+                        }
+                        for i in ifaces
+                    ]
+                }
+            )
+        except Exception:
+            return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/switch/start", methods=["POST"])
+def start_switch_monitoring():
+    """Start switch monitoring mode.
+    Body: { "interface": "Ethernet", "subnet": "172.16.0.0/16" }
+    """
+    global SWITCH_MONITOR_MODE, SWITCH_INTERFACE, SWITCH_SUBNET, SWITCH_MONITOR_RUNNING
+    global GEOIP_CACHE, VPN_CACHE, vpn_ips
+
+    if SWITCH_MONITOR_RUNNING:
+        return jsonify(
+            {"status": "already_running", "message": "Switch monitoring already active"}
+        )
+
+    data = request.json or {}
+    iface = data.get("interface")
+    subnet = data.get("subnet", "172.16.0.0/16")
+
+    # Validate subnet
+    try:
+        ipaddress.ip_network(subnet, strict=False)
+    except ValueError as e:
+        return jsonify({"error": f"Invalid subnet: {e}"}), 400
+
+    SWITCH_INTERFACE = iface
+    SWITCH_SUBNET = subnet
+    SWITCH_MONITOR_MODE = True
+
+    # Clear caches for fresh detection
+    GEOIP_CACHE.clear()
+    VPN_CACHE.clear()
+    vpn_ips.clear()
+
+    # Start monitoring in background thread
+    monitor_thread = threading.Thread(target=start_switch_monitor, daemon=True)
+    monitor_thread.start()
+
+    return jsonify(
+        {
+            "status": "started",
+            "message": f"Switch monitoring started on {iface or 'all interfaces'}",
+            "interface": iface,
+            "subnet": subnet,
+        }
+    )
+
+
+@app.route("/api/switch/stop")
+def stop_switch_monitoring():
+    """Stop switch monitoring"""
+    global SWITCH_MONITOR_RUNNING, SWITCH_MONITOR_MODE
+
+    SWITCH_MONITOR_RUNNING = False
+    SWITCH_MONITOR_MODE = False
+
+    # Summary
+    device_count = len(switch_devices)
+    vpn_device_count = sum(1 for d in switch_devices.values() if d.get("vpn_detected"))
+
+    return jsonify(
+        {
+            "status": "stopped",
+            "message": "Switch monitoring stopped",
+            "devices_seen": device_count,
+            "vpn_devices_detected": vpn_device_count,
+            "total_alerts": len(switch_vpn_alerts),
+        }
+    )
+
+
+@app.route("/api/switch/reset")
+def reset_switch_data():
+    """Reset all switch monitoring data (devices, alerts, caches)"""
+    global switch_devices, switch_vpn_alerts, SWITCH_MONITOR_RUNNING, SWITCH_MONITOR_MODE
+
+    was_running = SWITCH_MONITOR_RUNNING
+    SWITCH_MONITOR_RUNNING = False
+    SWITCH_MONITOR_MODE = False
+
+    with switch_device_lock:
+        old_devices = len(switch_devices)
+        old_alerts = len(switch_vpn_alerts)
+        switch_devices = {}
+        switch_vpn_alerts = []
+
+    return jsonify(
+        {
+            "status": "reset",
+            "message": "All switch data cleared",
+            "cleared_devices": old_devices,
+            "cleared_alerts": old_alerts,
+            "was_running": was_running,
+        }
+    )
+
+
+@app.route("/api/switch/status")
+def get_switch_status():
+    """Get current switch monitoring status"""
+    device_count = len(switch_devices)
+    vpn_device_count = sum(1 for d in switch_devices.values() if d.get("vpn_detected"))
+    total_packets = sum(d["total_packets"] for d in switch_devices.values())
+    total_bytes = sum(d["total_bytes"] for d in switch_devices.values())
+
+    return jsonify(
+        {
+            "monitoring": SWITCH_MONITOR_RUNNING,
+            "interface": SWITCH_INTERFACE,
+            "subnet": SWITCH_SUBNET,
+            "devices_count": device_count,
+            "vpn_devices_count": vpn_device_count,
+            "total_packets": total_packets,
+            "total_bytes": total_bytes,
+            "alert_count": len(switch_vpn_alerts),
+        }
+    )
+
+
+@app.route("/api/switch/devices")
+def get_switch_devices():
+    """Get all devices seen on the switch with their VPN status"""
+    sort_by = request.args.get("sort", "last_seen")  # last_seen, bytes, vpn
+    vpn_only = request.args.get("vpn_only", "false").lower() == "true"
+
+    with switch_device_lock:
+        devices = []
+        for ip, dev in switch_devices.items():
+            if vpn_only and not dev.get("vpn_detected"):
+                continue
+            devices.append(_sanitize_device(ip, dev))
+
+    # Sort
+    if sort_by == "bytes":
+        devices.sort(key=lambda d: d["total_bytes"], reverse=True)
+    elif sort_by == "vpn":
+        devices.sort(
+            key=lambda d: (d["vpn_detected"], d["vpn_packet_count"]), reverse=True
+        )
+    elif sort_by == "packets":
+        devices.sort(key=lambda d: d["total_packets"], reverse=True)
+    else:
+        devices.sort(key=lambda d: d["last_seen"], reverse=True)
+
+    return jsonify(
+        {
+            "devices": devices,
+            "total": len(devices),
+            "monitoring": SWITCH_MONITOR_RUNNING,
+        }
+    )
+
+
+@app.route("/api/switch/vpn_alerts")
+def get_switch_vpn_alerts():
+    """Get VPN detection alerts from switch monitoring"""
+    limit = int(request.args.get("limit", 50))
+    severity = request.args.get("severity")  # HIGH, MEDIUM
+
+    alerts = switch_vpn_alerts.copy()
+
+    if severity:
+        alerts = [a for a in alerts if a.get("severity") == severity]
+
+    # Most recent first
+    alerts = list(reversed(alerts[-limit:]))
+
+    # Summary stats
+    unique_vpn_devices = set(a["device_ip"] for a in switch_vpn_alerts)
+    unique_vpn_servers = set(a["vpn_server_ip"] for a in switch_vpn_alerts)
+    provider_counts = {}
+    for a in switch_vpn_alerts:
+        p = a.get("provider", "Unknown")
+        provider_counts[p] = provider_counts.get(p, 0) + 1
+
+    return jsonify(
+        {
+            "alerts": alerts,
+            "total_alerts": len(switch_vpn_alerts),
+            "unique_vpn_devices": len(unique_vpn_devices),
+            "unique_vpn_servers": len(unique_vpn_servers),
+            "provider_summary": provider_counts,
+            "monitoring": SWITCH_MONITOR_RUNNING,
+        }
+    )
+
+
+@app.route("/api/switch/map_data")
+def get_switch_map_data():
+    """Get geo-enriched data for plotting switch traffic on the map"""
+    with switch_device_lock:
+        map_nodes = []  # Unique geo points
+        map_links = []  # Lines between device (local) and external IPs
+        seen_coords = {}
+        user_loc = get_user_public_location()
+
+        for ip, dev in switch_devices.items():
+            for ext_ip, info in list(dev.get("external_ips", {}).items())[:15]:
+                geo = GEOIP_CACHE.get(ext_ip)
+                if not geo or not geo.get("lat"):
+                    continue
+                coord_key = f"{round(geo['lat'],2)},{round(geo['lon'],2)}"
+                is_vpn = geo.get("is_vpn", False)
+                if coord_key not in seen_coords:
+                    seen_coords[coord_key] = {
+                        "lat": geo["lat"],
+                        "lon": geo["lon"],
+                        "ip": ext_ip,
+                        "city": geo.get("city", ""),
+                        "country": geo.get("country", ""),
+                        "isp": geo.get("isp", ""),
+                        "is_vpn": is_vpn,
+                        "vpn_provider": geo.get("vpn_provider"),
+                        "packets": info["packets"],
+                        "bytes": info["bytes"],
+                        "device_ip": ip,
+                    }
+                else:
+                    seen_coords[coord_key]["packets"] += info["packets"]
+                    seen_coords[coord_key]["bytes"] += info["bytes"]
+                    if is_vpn:
+                        seen_coords[coord_key]["is_vpn"] = True
+                        seen_coords[coord_key]["vpn_provider"] = geo.get("vpn_provider")
+
+                # Link from device to ext
+                if user_loc:
+                    import random as _rnd
+
+                    map_links.append(
+                        {
+                            "src_lat": user_loc["lat"] + _rnd.uniform(-0.2, 0.2),
+                            "src_lon": user_loc["lon"] + _rnd.uniform(-0.2, 0.2),
+                            "dst_lat": geo["lat"],
+                            "dst_lon": geo["lon"],
+                            "device_ip": ip,
+                            "external_ip": ext_ip,
+                            "is_vpn": is_vpn,
+                            "packets": info["packets"],
+                        }
+                    )
+
+        map_nodes = list(seen_coords.values())
+
+    return jsonify(
+        {
+            "nodes": map_nodes,
+            "links": map_links,
+            "user_location": user_loc,
+            "device_count": len(switch_devices),
+        }
+    )
+
+
+@app.route("/api/switch/device/<device_ip>")
+def get_switch_device_detail(device_ip):
+    """Get detailed info for a specific device on the switch"""
+    with switch_device_lock:
+        if device_ip not in switch_devices:
+            return jsonify({"error": f"Device {device_ip} not found"}), 404
+
+        dev = switch_devices[device_ip]
+        detail = _sanitize_device(device_ip, dev)
+
+        # Add top external IPs
+        ext_ips = sorted(
+            dev["external_ips"].items(), key=lambda x: x[1]["bytes"], reverse=True
+        )[:20]
+        detail["top_external_ips"] = [
+            {
+                "ip": ip,
+                "packets": info["packets"],
+                "bytes": info["bytes"],
+                "first_seen": info["first_seen"],
+            }
+            for ip, info in ext_ips
+        ]
+
+        # Add device-specific alerts
+        detail["alerts"] = [
+            a for a in switch_vpn_alerts if a["device_ip"] == device_ip
+        ][-20:]
+
+    return jsonify(detail)
+
+
+# ============================================================================
+# API ROUTES - LIVE CAPTURE (FROM PACKETFLOW)
+# ============================================================================
+
+
+@app.route("/api/live/start")
+def start_live_capture():
+    """Start live packet capture"""
+    global capture_running, GEOIP_CACHE, VPN_CACHE, vpn_ips
+    if not capture_running:
+        # Clear caches to ensure fresh VPN detection
+        print("[INFO] Clearing GeoIP and VPN caches for fresh detection")
+        GEOIP_CACHE.clear()
+        VPN_CACHE.clear()
+        vpn_ips.clear()
+        live_stats["vpn_ips"].clear()
+        live_stats["vpn_details"].clear()
+
+        # Start capture in a background thread
+        capture_thread = threading.Thread(target=start_capture, daemon=True)
+        capture_thread.start()
+
+        return jsonify({"status": "started", "message": "Live packet capture started"})
+    return jsonify({"status": "already_running", "message": "Capture already running"})
+
+
+@app.route("/api/live/stop")
+def stop_live_capture():
+    """Stop live packet capture and auto-save"""
+    global capture_running, captured_packets, capture_session_name
+    capture_running = False
+
+    # Auto-save captured packets
+    save_result = {"status": "stopped", "message": "Live packet capture stopped"}
+
+    if captured_packets:
+        try:
+            # Ensure data directories exist
+            pcap_dir = Path("data/pcap")
+            parquet_dir = Path("data/parquet")
+            pcap_dir.mkdir(parents=True, exist_ok=True)
+            parquet_dir.mkdir(parents=True, exist_ok=True)
+
+            # Save to PCAP
+            pcap_filename = f"{capture_session_name}.pcap"
+            pcap_path = pcap_dir / pcap_filename
+            wrpcap(str(pcap_path), captured_packets)
+
+            print(f"[INFO] Auto-saved {len(captured_packets)} packets to {pcap_path}")
+
+            # Convert to Parquet
+            parquet_filename = f"{capture_session_name}.parquet"
+            parquet_path = parquet_dir / parquet_filename
+
+            try:
+                from src.parsers.scapy_parser import parse_pcap_with_scapy
+                from src.transformers.json_to_parquet import write_parquet_streaming
+
+                print(f"[INFO] Converting PCAP to Parquet using Scapy...")
+
+                packets = parse_pcap_with_scapy(str(pcap_path))
+
+                if packets:
+                    write_parquet_streaming(packets, str(parquet_path))
+                    print(
+                        f"[INFO] Converted {len(packets)} packets to Parquet: {parquet_path}"
+                    )
+
+                    save_result.update(
+                        {
+                            "saved": True,
+                            "pcap_file": str(pcap_path),
+                            "parquet_file": str(parquet_path),
+                            "packet_count": len(captured_packets),
+                        }
+                    )
+                else:
+                    print(f"[WARN] No packets parsed from PCAP")
+                    save_result.update(
+                        {
+                            "saved": True,
+                            "pcap_file": str(pcap_path),
+                            "packet_count": len(captured_packets),
+                            "parquet_error": "No packets parsed from PCAP",
+                        }
+                    )
+
+            except FileNotFoundError as e:
+                print(f"[ERROR] File not found: {e}")
+                save_result.update(
+                    {
+                        "saved": True,
+                        "pcap_file": str(pcap_path),
+                        "packet_count": len(captured_packets),
+                        "parquet_error": f"File not found: {str(e)}",
+                    }
+                )
+            except Exception as e:
+                print(f"[WARN] Parquet conversion failed: {e}")
+                save_result.update(
+                    {
+                        "saved": True,
+                        "pcap_file": str(pcap_path),
+                        "packet_count": len(captured_packets),
+                        "parquet_error": str(e),
+                    }
+                )
+
+        except Exception as e:
+            print(f"[ERROR] Failed to save capture: {e}")
+            save_result["save_error"] = str(e)
+    else:
+        save_result["message"] += " (no packets captured)"
+
+    return jsonify(save_result)
+
+
+@app.route("/api/live/stats")
+def get_live_stats():
+    """Get live capture statistics with enhanced metrics"""
+    uptime = time.time() - live_stats["start_time"] if live_stats["start_time"] else 0
+
+    # Calculate top talkers (top 5)
+    top_talkers = sorted(
+        live_stats["top_talkers"].items(), key=lambda x: x[1], reverse=True
+    )[:5]
+
+    # Calculate top ports (top 5)
+    top_ports = sorted(live_stats["ports"].items(), key=lambda x: x[1], reverse=True)[
+        :5
+    ]
+
+    # Calculate bandwidth (bytes per second)
+    bandwidth = live_stats["total_bytes"] / uptime if uptime > 0 else 0
+
+    return jsonify(
+        {
+            "total_packets": live_stats["total_packets"],
+            "tcp_packets": live_stats["tcp_packets"],
+            "udp_packets": live_stats["udp_packets"],
+            "unique_ips": len(live_stats["unique_ips"]),
+            "unique_src_ips": len(live_stats["unique_src_ips"]),
+            "unique_dst_ips": len(live_stats["unique_dst_ips"]),
+            "active_connections": len(live_stats["connections"]),
+            "capture_running": capture_running,
+            "uptime": uptime,
+            "total_bytes": live_stats["total_bytes"],
+            "bandwidth_bps": bandwidth,
+            "protocols": dict(live_stats["protocols"]),
+            "top_talkers": [
+                {"ip": ip, "bytes": bytes_count} for ip, bytes_count in top_talkers
+            ],
+            "top_ports": [{"port": port, "count": count} for port, count in top_ports],
+            "captured_packets_count": len(captured_packets),
+            "session_name": capture_session_name,
+            "vpn_ips_count": len(live_stats["vpn_ips"]),
+            "vpn_ips": list(live_stats["vpn_ips"])[:10],
+            "vpn_details": list(live_stats["vpn_details"].values())[:10],
+        }
+    )
+
+
+@app.route("/api/vpn/status")
+def get_vpn_db_status():
+    """Get VPN detection database status"""
+    vpn_lists_dir = Path("data/vpn_lists")
+    sources_status = {}
+    for name in ["x4bnet_ipv4", "tor_exit_nodes"]:
+        cache_file = vpn_lists_dir / f"{name}.txt"
+        if cache_file.exists():
+            age_hours = (time.time() - cache_file.stat().st_mtime) / 3600
+            line_count = len(cache_file.read_text().strip().splitlines())
+            sources_status[name] = {
+                "loaded": True,
+                "entries": line_count,
+                "age_hours": round(age_hours, 1),
+            }
+        else:
+            sources_status[name] = {"loaded": False, "entries": 0, "age_hours": None}
+
+    return jsonify(
+        {
+            "ip_ranges_loaded": len(VPN_IP_RANGES_V4),
+            "asn_entries": len(VPN_ASN_DATABASE),
+            "keyword_providers": len(VPN_PROVIDERS),
+            "cached_lookups": len(VPN_CACHE),
+            "vpn_ips_detected": len(vpn_ips),
+            "vpnapi_io_configured": bool(VPNAPI_IO_KEY),
+            "sources": sources_status,
+            "detection_layers": [
+                "ISP/Org keyword matching",
+                "Known VPN ASN database",
+                "X4BNet VPN IP ranges (GitHub)",
+                "Tor exit node list",
+                "ip-api.com proxy detection",
+                "vpnapi.io API" + (" (configured)" if VPNAPI_IO_KEY else " (no key)"),
+            ],
+        }
+    )
+
+
+@app.route("/api/vpn/refresh", methods=["POST"])
+def refresh_vpn_db():
+    """Force refresh VPN IP databases from public sources"""
+    global VPN_CACHE
+    try:
+        VPN_CACHE = {}  # Clear cache to re-evaluate with fresh data
+        # Delete cached files to force re-download
+        vpn_lists_dir = Path("data/vpn_lists")
+        for f in vpn_lists_dir.glob("*.txt"):
+            f.unlink()
+        download_vpn_ip_lists()
+        return jsonify(
+            {
+                "status": "success",
+                "ip_ranges_loaded": len(VPN_IP_RANGES_V4),
+                "message": "VPN databases refreshed successfully",
+            }
+        )
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route("/api/live/history")
+def get_live_history():
+    """Get recent packet history from live capture"""
+    return jsonify(list(packet_history))
+
+
+@app.route("/api/live/save")
+def save_live_capture():
+    """Save captured packets to PCAP file"""
+    global captured_packets, capture_session_name
+
+    if not captured_packets:
+        return jsonify({"error": "No packets captured"}), 400
+
+    try:
+        # Ensure data directories exist
+        pcap_dir = Path("data/pcap")
+        parquet_dir = Path("data/parquet")
+        pcap_dir.mkdir(parents=True, exist_ok=True)
+        parquet_dir.mkdir(parents=True, exist_ok=True)
+
+        # Save to PCAP
+        pcap_filename = f"{capture_session_name}.pcap"
+        pcap_path = pcap_dir / pcap_filename
+        wrpcap(str(pcap_path), captured_packets)
+
+        print(f"[INFO] Saved {len(captured_packets)} packets to {pcap_path}")
+
+        # Convert to Parquet using CLI parser
+        parquet_filename = f"{capture_session_name}.parquet"
+        parquet_path = parquet_dir / parquet_filename
+
+        # Import and use the parser
+        from src.parsers.tshark_wrapper import TSharkWrapper
+        from src.transformers.json_to_parquet import json_to_parquet
+
+        try:
+            print(f"[INFO] Converting PCAP to Parquet...")
+            wrapper = TSharkWrapper()
+            json_data = wrapper.parse_pcap(str(pcap_path))
+            json_to_parquet(json_data, str(parquet_path))
+            print(f"[INFO] Converted to Parquet: {parquet_path}")
+
+            return jsonify(
+                {
+                    "status": "success",
+                    "message": f"Saved {len(captured_packets)} packets",
+                    "pcap_file": str(pcap_path),
+                    "parquet_file": str(parquet_path),
+                    "packet_count": len(captured_packets),
+                }
+            )
+        except Exception as e:
+            print(f"[WARN] Parquet conversion failed: {e}")
+            return jsonify(
+                {
+                    "status": "partial",
+                    "message": f"Saved PCAP but Parquet conversion failed",
+                    "pcap_file": str(pcap_path),
+                    "packet_count": len(captured_packets),
+                    "error": str(e),
+                }
+            )
+
+    except Exception as e:
+        print(f"[ERROR] Error saving capture: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/live/load_saved")
+def load_saved_capture():
+    """Load the most recent saved capture for analysis (converts PCAP to Parquet if needed)"""
+    global conn, parquet_path, capture_running
+
+    try:
+        pcap_dir = Path("data/pcap")
+        parquet_dir = Path("data/parquet")
+
+        # Ensure directories exist
+        pcap_dir.mkdir(parents=True, exist_ok=True)
+        parquet_dir.mkdir(parents=True, exist_ok=True)
+
+        # Find most recent PCAP file
+        pcap_files = list(pcap_dir.glob("*.pcap"))
+        if not pcap_files:
+            return jsonify({"error": "No saved captures found"}), 404
+
+        latest_pcap = max(pcap_files, key=lambda p: p.stat().st_mtime)
+        print(f"[INFO] Found latest PCAP: {latest_pcap}")
+
+        # Check if corresponding Parquet exists
+        parquet_file = parquet_dir / f"{latest_pcap.stem}.parquet"
+
+        if not parquet_file.exists():
+            print(f"[INFO] Parquet not found, converting {latest_pcap} to Parquet...")
+
+            try:
+                from src.parsers.scapy_parser import parse_pcap_with_scapy
+                from src.transformers.json_to_parquet import write_parquet_streaming
+
+                packets = parse_pcap_with_scapy(str(latest_pcap))
+
+                if packets:
+                    write_parquet_streaming(packets, str(parquet_file))
+                    print(
+                        f"[INFO] Successfully converted {len(packets)} packets to {parquet_file}"
+                    )
+                else:
+                    raise Exception("No packets parsed from PCAP")
+
+            except FileNotFoundError as e:
+                return (
+                    jsonify(
+                        {
+                            "error": f"File not found: {str(e)}",
+                            "pcap_file": str(latest_pcap),
+                        }
+                    ),
+                    500,
+                )
+
+            except Exception as e:
+                print(f"[ERROR] Failed to convert PCAP to Parquet: {e}")
+                return (
+                    jsonify(
+                        {
+                            "error": f"Failed to convert PCAP to Parquet: {str(e)}",
+                            "pcap_file": str(latest_pcap),
+                        }
+                    ),
+                    500,
+                )
+        else:
+            print(f"[INFO] Using existing Parquet: {parquet_file}")
+
+        # Stop live capture if running
+        capture_running = False
+        time.sleep(0.5)
+
+        # Load the parquet file
+        load_parquet(str(parquet_file))
+
+        return jsonify(
+            {
+                "status": "success",
+                "message": f"Loaded {latest_pcap.name}",
+                "pcap_file": str(latest_pcap),
+                "parquet_file": str(parquet_file),
+            }
+        )
+
+    except Exception as e:
+        print(f"[ERROR] Error loading saved capture: {e}")
+        import traceback
+
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+# ============================================================================
+# API ROUTES - FILE LOADING
+# ============================================================================
+
+
+@app.route("/api/load_parquet", methods=["POST"])
+def load_parquet_route():
+    """Load a parquet file for analysis"""
+    data = request.json
+    path = data.get("path")
+
+    if not path:
+        return jsonify({"error": "No path provided"}), 400
+
+    if not Path(path).exists():
+        return jsonify({"error": f"File not found: {path}"}), 404
+
+    try:
+        load_parquet(path)
+        return jsonify({"status": "success", "message": f"Loaded {path}", "path": path})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/upload_pcap", methods=["POST"])
+def upload_pcap():
+    """Upload and process PCAP file"""
+    if "file" not in request.files:
+        return jsonify({"error": "No file provided"}), 400
+
+    file = request.files["file"]
+    if file.filename == "":
+        return jsonify({"error": "No file selected"}), 400
+
+    if not file.filename.endswith((".pcap", ".pcapng")):
+        return jsonify({"error": "File must be .pcap or .pcapng"}), 400
+
+    try:
+        pcap_dir = Path("data/pcap")
+        parquet_dir = Path("data/parquet")
+        pcap_dir.mkdir(parents=True, exist_ok=True)
+        parquet_dir.mkdir(parents=True, exist_ok=True)
+
+        # Check if this is a live capture file that was just saved
+        uploaded_filename = Path(file.filename).stem
+
+        # Check if a matching parquet already exists (from live capture)
+        matching_parquet = None
+        for existing_parquet in parquet_dir.glob("*.parquet"):
+            # Match if the base filename is the same (e.g., "live_capture_20260202_145350")
+            if existing_parquet.stem == uploaded_filename:
+                matching_parquet = existing_parquet
+                print(
+                    f"[INFO] Found matching parquet from live capture: {matching_parquet}"
+                )
+                break
+
+        if matching_parquet and matching_parquet.exists():
+            # Use existing parquet instead of re-processing
+            print(f"[INFO] Reusing existing parquet file: {matching_parquet}")
+
+            # Count packets in existing parquet
+            import duckdb
+
+            temp_conn = duckdb.connect(":memory:")
+            temp_conn.execute(
+                f"CREATE TABLE packets AS SELECT * FROM read_parquet('{matching_parquet}')"
+            )
+            packet_count = temp_conn.execute("SELECT COUNT(*) FROM packets").fetchone()[
+                0
+            ]
+            temp_conn.close()
+
+            # Load into main DuckDB connection
+            load_parquet(str(matching_parquet))
+
+            return jsonify(
+                {
+                    "status": "success",
+                    "message": f"Loaded existing capture with {packet_count} packets",
+                    "parquet_path": str(matching_parquet),
+                    "packet_count": packet_count,
+                    "reused": True,
+                }
+            )
+
+        # File doesn't exist, process normally
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_filename = uploaded_filename
+        pcap_path = pcap_dir / f"{safe_filename}_{timestamp}.pcap"
+        parquet_path = parquet_dir / f"{safe_filename}_{timestamp}.parquet"
+
+        file.save(str(pcap_path))
+        print(f"[INFO] Saved uploaded PCAP: {pcap_path}")
+
+        # Convert to Parquet
+        from src.parsers.scapy_parser import parse_pcap_with_scapy
+        from src.transformers.json_to_parquet import write_parquet_streaming
+
+        print(f"[INFO] Converting PCAP to Parquet...")
+        packets = parse_pcap_with_scapy(str(pcap_path))
+
+        if not packets:
+            return jsonify({"error": "No packets found in PCAP file"}), 400
+
+        write_parquet_streaming(packets, str(parquet_path))
+        print(f"[INFO] Converted {len(packets)} packets to Parquet: {parquet_path}")
+
+        # Load into DuckDB
+        load_parquet(str(parquet_path))
+
+        return jsonify(
+            {
+                "status": "success",
+                "message": f"Loaded {len(packets)} packets from {file.filename}",
+                "pcap_path": str(pcap_path),
+                "parquet_path": str(parquet_path),
+                "packet_count": len(packets),
+                "reused": False,
+            }
+        )
+
+    except Exception as e:
+        print(f"[ERROR] Upload failed: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+# ============================================================================
+# WEBSOCKET HANDLERS
+# ============================================================================
+
+
+@socketio.on("connect")
+def handle_connect():
+    """Handle client WebSocket connection"""
+    print("[INFO] Client connected via WebSocket")
+    emit("connection_response", {"status": "connected"})
+
+
+@socketio.on("disconnect")
+def handle_disconnect():
+    """Handle client WebSocket disconnection"""
+    print("[INFO] Client disconnected")
+
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+if __name__ == "__main__":
+    print("=" * 70)
+    print("5G-PacketSense Integrated - Unified Network Analysis Platform")
+    print("=" * 70)
+    print("\nFeatures:")
+    print("  ✓ PCAP file analysis with DuckDB")
+    print("  ✓ Live packet capture with real-time visualization")
+    print("  ✓ AI-powered natural language queries")
+    print("  ✓ Interactive geolocation mapping")
+    print("  ✓ Protocol analysis and statistics")
+    print("\nStarting server on http://localhost:5000")
+
+    # Load VPN IP databases at startup
+    print("\n[VPN-DB] Loading public VPN detection databases...")
+    try:
+        download_vpn_ip_lists()
+    except Exception as e:
+        print(f"[VPN-DB] Warning: Could not load VPN IP lists: {e}")
+        print("[VPN-DB] VPN detection will still work via keyword/ASN/API methods")
+
+    print("\nIMPORTANT for live capture:")
+    print("  Windows: Run as Administrator")
+    print("  Linux/Mac: Use sudo python app.py")
+    print("\nOptional: Load PCAP with: python app.py <parquet_file>")
+    print("=" * 70 + "\n")
+
+    # Auto-load parquet if provided
+    if len(sys.argv) >= 2:
+        parquet_file = sys.argv[1]
+        if Path(parquet_file).exists():
+            load_parquet(parquet_file)
+        else:
+            print(f"[WARN] File not found: {parquet_file}")
+
+    socketio.run(app, debug=True, host="0.0.0.0", port=5000, allow_unsafe_werkzeug=True)

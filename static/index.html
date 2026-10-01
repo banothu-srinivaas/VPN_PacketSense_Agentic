@@ -1,0 +1,3896 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="UTF-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+		<title>5G-PacketSense Integrated | Mission Control</title>
+
+		<!-- Leaflet & Fonts -->
+		<link
+			rel="stylesheet"
+			href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+		/>
+		<link
+			href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
+			rel="stylesheet"
+		/>
+		<link
+			rel="stylesheet"
+			href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css"
+		/>
+
+		<!-- Libraries -->
+		<script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+		<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+		<script src="https://cdn.jsdelivr.net/npm/interactjs/dist/interact.min.js"></script>
+		<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+		<link
+			rel="stylesheet"
+			href="https://cdnjs.cloudflare.com/ajax/libs/noUiSlider/15.7.1/nouislider.min.css"
+		/>
+		<script src="https://cdnjs.cloudflare.com/ajax/libs/noUiSlider/15.7.1/nouislider.min.js"></script>
+
+		<style>
+			:root {
+				--glass-bg: rgba(15, 23, 42, 0.65);
+				--glass-border: 1px solid rgba(255, 255, 255, 0.08);
+				--glass-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.3);
+				--accent: #38bdf8;
+				--danger: #ef4444;
+				--success: #22c55e;
+				--text-main: #f8fafc;
+				--text-muted: #94a3b8;
+			}
+
+			* {
+				box-sizing: border-box;
+				margin: 0;
+				padding: 0;
+			}
+
+			body {
+				font-family: 'Inter', sans-serif;
+				background: #000;
+				color: var(--text-main);
+				height: 100vh;
+				overflow: hidden;
+			}
+
+			/* Full Screen Map */
+			#map {
+				position: absolute;
+				inset: 0;
+				z-index: 0;
+				background: #020617;
+			}
+
+			/* Animated flow lines */
+			@keyframes dash-flow {
+				from {
+					stroke-dashoffset: 0;
+				}
+				to {
+					stroke-dashoffset: 20;
+				}
+			}
+
+			/* Pulsing animation for local IP markers */
+			@keyframes pulse-glow {
+				0%,
+				100% {
+					box-shadow: 0 0 6px 2px rgba(56, 189, 248, 0.35);
+					opacity: 1;
+				}
+				50% {
+					box-shadow: 0 0 14px 5px rgba(56, 189, 248, 0.65);
+					opacity: 0.92;
+				}
+			}
+
+			.leaflet-interactive.local-ip-marker {
+				animation: pulse-glow 2s ease-in-out infinite !important;
+			}
+
+			/* VPN pulsating marker */
+			@keyframes vpn-pulse {
+				0%,
+				100% {
+					box-shadow: 0 0 4px 2px rgba(239, 68, 68, 0.25);
+					opacity: 1;
+				}
+				50% {
+					box-shadow: 0 0 18px 8px rgba(239, 68, 68, 0.7);
+					opacity: 0.85;
+				}
+			}
+			.leaflet-interactive.vpn-marker {
+				animation: vpn-pulse 1.4s ease-in-out infinite !important;
+			}
+
+			/* Switch device marker */
+			@keyframes sw-device-pulse {
+				0%,
+				100% {
+					box-shadow: 0 0 4px 1px rgba(245, 158, 11, 0.25);
+				}
+				50% {
+					box-shadow: 0 0 10px 4px rgba(245, 158, 11, 0.55);
+				}
+			}
+			.leaflet-interactive.sw-device-marker {
+				animation: sw-device-pulse 2.5s ease-in-out infinite !important;
+			}
+
+			/* Top Bar */
+			.top-bar {
+				position: absolute;
+				top: 0;
+				left: 0;
+				right: 0;
+				height: 64px;
+				background: rgba(15, 23, 42, 0.8);
+				backdrop-filter: blur(12px);
+				border-bottom: var(--glass-border);
+				display: flex;
+				align-items: center;
+				justify-content: space-between;
+				padding: 0 28px;
+				z-index: 50;
+			}
+
+			.brand {
+				font-weight: 700;
+				font-size: 20px;
+				display: flex;
+				align-items: center;
+				gap: 12px;
+				background: linear-gradient(to right, #fff, #94a3b8);
+				-webkit-background-clip: text;
+				-webkit-text-fill-color: transparent;
+			}
+
+			.mode-indicator {
+				display: flex;
+				align-items: center;
+				gap: 8px;
+				padding: 8px 14px;
+				background: rgba(0, 0, 0, 0.3);
+				border-radius: 8px;
+				font-size: 13px;
+			}
+
+			.mode-indicator.live {
+				border: 1px solid var(--success);
+				color: var(--success);
+			}
+
+			.mode-indicator.pcap {
+				border: 1px solid var(--accent);
+				color: var(--accent);
+			}
+
+			/* Floating Glass Windows */
+			.window {
+				position: absolute;
+				background: var(--glass-bg);
+				backdrop-filter: blur(16px);
+				border: var(--glass-border);
+				border-radius: 12px;
+				box-shadow: var(--glass-shadow);
+				display: flex;
+				flex-direction: column;
+				overflow: hidden;
+				z-index: 10;
+				transition:
+					opacity 0.2s,
+					transform 0.2s;
+			}
+
+			.window-header {
+				padding: 14px 20px;
+				border-bottom: var(--glass-border);
+				display: flex;
+				justify-content: space-between;
+				align-items: center;
+				cursor: grab;
+				background: rgba(255, 255, 255, 0.03);
+				user-select: none;
+			}
+
+			.window-header:active {
+				cursor: grabbing;
+			}
+
+			.window-title {
+				font-size: 14px;
+				font-weight: 600;
+				text-transform: uppercase;
+				letter-spacing: 0.5px;
+				color: var(--text-muted);
+				display: flex;
+				align-items: center;
+				gap: 8px;
+			}
+
+			.window-controls i {
+				margin-left: 8px;
+				cursor: pointer;
+				opacity: 0.6;
+				transition: opacity 0.2s;
+			}
+
+			.window-controls i:hover {
+				opacity: 1;
+				color: var(--accent);
+			}
+
+			.window.minimized .window-content {
+				display: none;
+			}
+
+			.window.minimized {
+				height: auto !important;
+			}
+
+			.window-content {
+				flex: 1;
+				padding: 20px;
+				overflow-y: auto;
+				font-size: 14px;
+			}
+
+			/* Initial Positions */
+			#config-window {
+				top: 80px;
+				left: 20px;
+				width: 380px;
+				max-height: 85vh;
+			}
+
+			#stats-window {
+				top: 80px;
+				right: 20px;
+				width: 400px;
+				 max-height: calc(100vh - 100px); /* IMPORTANT */
+                 display: flex;
+                 flex-direction: column;
+			}
+
+			#graph-window {
+				top: 100px;
+				left: 360px;
+				width: 600px;
+				height: 500px;
+				display: none;
+			}
+
+			#details-window {
+				top: 50%;
+				left: 50%;
+				width: 600px;
+				height: 400px;
+				transform: translate(-50%, -50%);
+				display: none;
+				z-index: 60;
+			}
+
+			#packet-details-window {
+				top: 80px;
+				left: 420px;
+				width: 440px;
+				max-height: calc(100vh - 100px);
+			}
+
+			#vpn-alerts-window {
+				top: 80px;
+				right: 360px;
+				width: 350px;
+				max-height: 400px;
+				display: none;
+			}
+
+			#switch-monitor-window {
+				top: 80px;
+				right: 20px;
+				width: 500px;
+				max-height: calc(100vh - 100px);
+				display: none;
+				z-index: 15;
+			}
+
+			#switch-monitor-window .window-content {
+				max-height: calc(100vh - 160px);
+				overflow-y: auto;
+				padding: 18px;
+			}
+
+			/* --- Scoped Switch Monitor Styles --- */
+			/* Reset global form styles inside .sw-monitor */
+			.sw-monitor select,
+			.sw-monitor input[type='text'],
+			.sw-monitor input[type='checkbox'] {
+				margin-bottom: 0;
+				padding: 0;
+				font-size: inherit;
+				width: auto;
+			}
+			.sw-monitor label {
+				margin-bottom: 0;
+				font-size: inherit;
+				text-transform: none;
+				letter-spacing: normal;
+			}
+
+			.sw-status-bar {
+				padding: 12px 16px;
+				background: rgba(0, 0, 0, 0.3);
+				border-radius: 8px;
+				margin-bottom: 14px;
+				font-size: 13px;
+				display: flex;
+				align-items: center;
+				justify-content: space-between;
+			}
+
+			.sw-config-section {
+				margin-bottom: 12px;
+			}
+
+			.sw-section-title {
+				font-size: 12px;
+				font-weight: 600;
+				text-transform: uppercase;
+				color: var(--text-muted);
+				margin-bottom: 10px;
+				letter-spacing: 0.5px;
+				display: flex;
+				align-items: center;
+				gap: 8px;
+			}
+
+			.sw-config-grid {
+				display: grid;
+				grid-template-columns: 1fr;
+				gap: 8px;
+			}
+
+			.sw-field {
+				display: flex;
+				flex-direction: column;
+				gap: 3px;
+			}
+
+			.sw-label {
+				font-size: 12px !important;
+				color: var(--text-muted) !important;
+				text-transform: none !important;
+				letter-spacing: normal !important;
+				margin-bottom: 2px !important;
+			}
+
+			.sw-select,
+			.sw-input {
+				width: 100% !important;
+				padding: 9px 12px !important;
+				font-size: 13px !important;
+				background: rgba(0, 0, 0, 0.3) !important;
+				border: 1px solid rgba(255, 255, 255, 0.1) !important;
+				color: #fff !important;
+				border-radius: 6px !important;
+				margin-bottom: 0 !important;
+				font-family: 'Inter', sans-serif;
+				outline: none;
+				transition: border-color 0.2s;
+			}
+
+			.sw-select:focus,
+			.sw-input:focus {
+				border-color: var(--accent) !important;
+			}
+
+			.sw-select option {
+				background: #1e293b;
+				color: #fff;
+			}
+
+			/* Buttons */
+			.sw-btn-grid {
+				display: grid;
+				grid-template-columns: 1fr 1fr;
+				gap: 8px;
+				margin-bottom: 14px;
+			}
+
+			.sw-btn {
+				display: flex;
+				flex-direction: column;
+				align-items: center;
+				justify-content: center;
+				gap: 4px;
+				padding: 12px 10px;
+				border-radius: 8px;
+				border: none;
+				font-size: 14px;
+				font-weight: 600;
+				font-family: 'Inter', sans-serif;
+				cursor: pointer;
+				transition:
+					filter 0.2s,
+					transform 0.1s;
+			}
+
+			.sw-btn:hover {
+				filter: brightness(1.15);
+			}
+
+			.sw-btn:active {
+				transform: scale(0.97);
+			}
+
+			.sw-btn div {
+				font-size: 12px;
+				font-weight: 500;
+			}
+
+			.sw-btn-start {
+				background: var(--success);
+				color: #fff;
+			}
+
+			.sw-btn-stop {
+				background: var(--danger);
+				color: #fff;
+			}
+
+			.sw-btn-refresh {
+				background: transparent;
+				border: 1px solid rgba(255, 255, 255, 0.15);
+				color: var(--text-muted);
+			}
+
+			.sw-btn-refresh:hover {
+				border-color: var(--accent);
+				color: var(--accent);
+			}
+
+			.sw-btn-reset {
+				background: transparent;
+				border: 1px solid rgba(239, 68, 68, 0.25);
+				color: rgba(239, 68, 68, 0.7);
+			}
+
+			.sw-btn-reset:hover {
+				border-color: #ef4444;
+				color: #ef4444;
+				background: rgba(239, 68, 68, 0.08);
+			}
+
+			/* Stat cards */
+			.sw-stats-grid {
+				display: grid;
+				grid-template-columns: repeat(4, 1fr);
+				gap: 6px;
+				margin-bottom: 14px;
+			}
+
+			.sw-stat-card {
+				background: rgba(255, 255, 255, 0.04);
+				padding: 12px 8px;
+				border-radius: 8px;
+				text-align: center;
+				border: 1px solid rgba(255, 255, 255, 0.05);
+			}
+
+			.sw-stat-card.sw-stat-vpn {
+				background: rgba(239, 68, 68, 0.06);
+				border-color: rgba(239, 68, 68, 0.15);
+			}
+
+			.sw-stat-value {
+				font-size: 22px;
+				font-weight: 700;
+				line-height: 1.2;
+			}
+
+			.sw-stat-label {
+				font-size: 10px;
+				color: var(--text-muted);
+				text-transform: uppercase;
+				letter-spacing: 0.3px;
+				margin-top: 4px;
+			}
+
+			.sw-divider {
+				border: none;
+				border-top: 1px solid rgba(255, 255, 255, 0.06);
+				margin: 10px 0;
+			}
+
+			/* Tabs */
+			.sw-tab-bar {
+				display: flex;
+				gap: 4px;
+				margin-bottom: 10px;
+			}
+
+			.sw-tab {
+				flex: 1;
+				padding: 10px 10px;
+				font-size: 13px;
+				font-weight: 600;
+				font-family: 'Inter', sans-serif;
+				background: transparent;
+				border: 1px solid rgba(255, 255, 255, 0.1);
+				border-radius: 6px;
+				color: var(--text-muted);
+				cursor: pointer;
+				transition: all 0.2s;
+				display: flex;
+				align-items: center;
+				justify-content: center;
+				gap: 6px;
+			}
+
+			.sw-tab:hover {
+				border-color: rgba(255, 255, 255, 0.2);
+				color: #fff;
+			}
+
+			.sw-tab.sw-tab-active {
+				background: rgba(56, 189, 248, 0.1);
+				border-color: var(--accent);
+				color: var(--accent);
+			}
+
+			.sw-tab.sw-tab-alert {
+				background: rgba(239, 68, 68, 0.1);
+				border-color: #ef4444;
+				color: #ef4444;
+			}
+
+			.sw-tab-content {
+				max-height: 400px;
+				overflow-y: auto;
+			}
+
+			.sw-tab-header {
+				display: flex;
+				justify-content: space-between;
+				align-items: center;
+				margin-bottom: 10px;
+				font-size: 12px;
+				color: var(--text-muted);
+				text-transform: uppercase;
+				letter-spacing: 0.3px;
+			}
+
+			.sw-checkbox-label {
+				display: flex !important;
+				align-items: center;
+				gap: 5px;
+				cursor: pointer;
+				font-size: 12px !important;
+				text-transform: none !important;
+				color: var(--text-muted) !important;
+			}
+
+			.sw-checkbox-label input[type='checkbox'] {
+				width: 15px !important;
+				height: 15px;
+				accent-color: var(--accent);
+			}
+
+			.sw-empty-state {
+				text-align: center;
+				padding: 28px 14px;
+				color: var(--text-muted);
+				font-size: 13px;
+			}
+
+			/* Device cards */
+			.switch-device-card {
+				background: rgba(0, 0, 0, 0.25);
+				border-radius: 10px;
+				padding: 14px 16px;
+				margin-bottom: 10px;
+				border: 1px solid rgba(255, 255, 255, 0.06);
+				transition:
+					border-color 0.2s,
+					background 0.2s;
+			}
+
+			.switch-device-card:hover {
+				border-color: rgba(56, 189, 248, 0.25);
+				background: rgba(0, 0, 0, 0.35);
+			}
+
+			.switch-device-card.vpn-detected {
+				border-color: rgba(239, 68, 68, 0.35);
+				background: rgba(239, 68, 68, 0.04);
+			}
+
+			.switch-device-card.vpn-detected:hover {
+				border-color: rgba(239, 68, 68, 0.5);
+				background: rgba(239, 68, 68, 0.07);
+			}
+
+			.switch-vpn-badge {
+				display: inline-flex;
+				align-items: center;
+				gap: 5px;
+				background: rgba(239, 68, 68, 0.15);
+				color: #ef4444;
+				padding: 4px 10px;
+				border-radius: 5px;
+				font-size: 11px;
+				font-weight: 600;
+				letter-spacing: 0.3px;
+				animation: pulse-danger 2s infinite;
+			}
+
+			@keyframes pulse-danger {
+				0%,
+				100% {
+					opacity: 1;
+				}
+				50% {
+					opacity: 0.6;
+				}
+			}
+
+			/* Alert items */
+			.switch-alert-item {
+				padding: 10px 12px;
+				border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+				font-size: 13px;
+				transition: background 0.15s;
+			}
+
+			.switch-alert-item:hover {
+				background: rgba(255, 255, 255, 0.02);
+			}
+
+			.switch-alert-item:last-child {
+				border-bottom: none;
+			}
+
+			.switch-alert-item.severity-HIGH {
+				border-left: 3px solid #ef4444;
+				padding-left: 10px;
+			}
+
+			.switch-alert-item.severity-MEDIUM {
+				border-left: 3px solid #f59e0b;
+				padding-left: 10px;
+			}
+
+			select,
+			input[type='number'],
+			input[type='text'] {
+				width: 100%;
+				background: rgba(0, 0, 0, 0.3);
+				border: 1px solid rgba(255, 255, 255, 0.1);
+				color: #fff;
+				padding: 11px;
+				border-radius: 8px;
+				margin-bottom: 14px;
+				font-family: inherit;
+				font-size: 14px;
+				outline: none;
+				transition: border-color 0.2s;
+			}
+
+			select:focus,
+			input[type='number']:focus,
+			input[type='text']:focus {
+				border-color: var(--accent);
+			}
+
+			select option {
+				background: #1e293b;
+				color: #fff;
+			}
+
+			/* Section Headings & Filter Groups */
+			.section-heading {
+				margin-bottom: 16px;
+				font-size: 13px;
+				text-transform: uppercase;
+				letter-spacing: 0.5px;
+				color: var(--text-muted);
+				display: flex;
+				align-items: center;
+				gap: 8px;
+			}
+
+			.filter-group {
+				margin-bottom: 16px;
+			}
+
+			.filter-group label {
+				font-size: 12px;
+				color: var(--text-muted);
+				display: block;
+				margin-bottom: 6px;
+				letter-spacing: 0.5px;
+			}
+
+			.filter-group select,
+			.filter-group input {
+				margin-bottom: 0;
+			}
+
+			.cp-divider {
+				margin: 18px 0;
+				border: none;
+				border-top: 1px solid rgba(255, 255, 255, 0.08);
+			}
+
+			.flow-list-header {
+				display: flex;
+				justify-content: space-between;
+				align-items: center;
+				margin-bottom: 10px;
+			}
+
+			.flow-list-header h3 {
+				margin: 0;
+				font-size: 13px;
+				text-transform: uppercase;
+				letter-spacing: 0.5px;
+				color: var(--text-muted);
+			}
+
+			.flow-list-header .badge {
+				font-size: 12px;
+				font-weight: 600;
+				padding: 3px 10px;
+				border-radius: 10px;
+				background: rgba(56, 189, 248, 0.15);
+				color: var(--accent);
+			}
+
+			.flow-list-container {
+				height: 250px;
+				overflow-y: auto;
+				background: rgba(0, 0, 0, 0.3);
+				border-radius: 8px;
+				border: 1px solid rgba(255, 255, 255, 0.05);
+			}
+
+			.flow-list-empty {
+				text-align: center;
+				padding: 28px 18px;
+				color: var(--text-muted);
+				font-size: 13px;
+			}
+
+			.flow-list-empty i {
+				font-size: 28px;
+				opacity: 0.3;
+				display: block;
+				margin-bottom: 10px;
+			}
+
+			label {
+				display: block;
+				margin-bottom: 6px;
+				font-size: 12px;
+				color: var(--text-muted);
+				text-transform: uppercase;
+				letter-spacing: 0.5px;
+			}
+
+			.btn {
+				background: var(--accent);
+				color: #000;
+				border: none;
+				padding: 12px;
+				border-radius: 8px;
+				width: 100%;
+				font-weight: 600;
+				font-size: 14px;
+				cursor: pointer;
+				transition: filter 0.2s;
+			}
+
+			.btn:hover {
+				filter: brightness(1.1);
+			}
+
+			.btn-outline {
+				background: transparent;
+				border: 1px solid var(--accent);
+				color: var(--accent);
+			}
+
+			.btn-success {
+				background: var(--success);
+			}
+
+			.btn-danger {
+				background: var(--danger);
+			}
+
+			/* Packet Details Styles */
+			.dot {
+				height: 4px;
+				background: var(--text-muted);
+				border-radius: 50%;
+				animation: bounce 1.4s infinite ease-in-out both;
+			}
+
+			.dot:nth-child(1) {
+				animation-delay: -0.32s;
+			}
+
+			.dot:nth-child(2) {
+				animation-delay: -0.16s;
+			}
+
+			@keyframes bounce {
+				0%,
+				80%,
+				100% {
+					transform: scale(0);
+				}
+				40% {
+					transform: scale(1);
+				}
+			}
+
+			/* noUiSlider Customization */
+			.noUi-target {
+				background: rgba(255, 255, 255, 0.1);
+				border: none;
+				box-shadow: none;
+				height: 6px;
+			}
+
+			.noUi-connect {
+				background: var(--accent);
+			}
+
+			.noUi-handle {
+				background: #fff;
+				box-shadow: 0 0 10px var(--accent);
+				border: none;
+				border-radius: 50%;
+				width: 16px;
+				height: 16px;
+				right: -8px;
+				top: -5px;
+				cursor: grab;
+			}
+
+			.noUi-handle:before,
+			.noUi-handle:after {
+				display: none;
+			}
+
+			/* Flow List */
+			.flow-item {
+				padding: 12px;
+				border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+				font-size: 13px;
+				cursor: pointer;
+			}
+
+			.flow-item:hover {
+				background: rgba(255, 255, 255, 0.05);
+			}
+
+			/* Scrollbar */
+			::-webkit-scrollbar {
+				width: 5px;
+				height: 5px;
+			}
+
+			::-webkit-scrollbar-thumb {
+				background: rgba(255, 255, 255, 0.2);
+				border-radius: 10px;
+			}
+
+			.spinner {
+				animation: spin 1s linear infinite;
+			}
+
+			@keyframes spin {
+				100% {
+					transform: rotate(360deg);
+				}
+			}
+
+			.pulse {
+				animation: pulse 2s infinite;
+			}
+
+			@keyframes pulse {
+				0%,
+				100% {
+					opacity: 1;
+				}
+				50% {
+					opacity: 0.5;
+				}
+			}
+
+			/* Collapsible Packet Details */
+			.packet-detail-section {
+				cursor: pointer;
+				user-select: none;
+				transition: color 0.2s;
+			}
+
+			.packet-detail-section:hover {
+				color: var(--accent) !important;
+			}
+
+			.packet-detail-section i {
+				transition: transform 0.2s;
+			}
+
+			.packet-detail-section.expanded i {
+				transform: rotate(90deg);
+			}
+			.nav-dropdown {
+    position: relative;
+}
+
+.nav-btn {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.dropdown-menu {
+    position: absolute;
+    top: 40px;
+    right: 0;
+    background: rgba(15,23,42,0.95);
+    backdrop-filter: blur(12px);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 10px;
+    padding: 8px 0;
+    min-width: 180px;
+    display: none;
+    flex-direction: column;
+    z-index: 100;
+}
+
+.dropdown-menu div {
+    padding: 10px 14px;
+    cursor: pointer;
+    font-size: 13px;
+    color: var(--text-muted);
+    display: flex;
+    gap: 8px;
+}
+
+.dropdown-menu div:hover {
+    background: rgba(56,189,248,0.1);
+    color: var(--accent);
+}
+
+.nav-dropdown:hover .dropdown-menu {
+    display: flex;
+}
+#vpn-window {
+    top: 80px;
+    right: 430px;
+    width: 300px;
+    max-height: 400px;
+}
+#vpn-panel {
+    top: 80px;
+    right: 430px; /* adjust if needed */
+    width: 300px;
+    max-height: 400px;
+    z-index: 20;
+}
+		</style>
+	</head>
+
+	<body>
+		<!-- Map Background -->
+		<div id="map"></div>
+
+		<!-- Top Bar -->
+		<div class="top-bar">
+			<div class="brand">
+				<i class="fa-solid fa-satellite-dish" style="color: var(--accent)"></i>
+				5G-PacketSense
+				<span style="font-size: 12px; font-weight: 400; margin-left: 8px"
+					>Integrated</span
+				>
+			</div>
+			<div style="display: flex; align-items: center; gap: 16px">
+				<div id="mode-status" class="mode-indicator">
+					<span id="sessionTimerText" style="font-size:13px; color:#f59e0b; font-weight:600;"></span>
+					<i class="fa-solid fa-circle"></i>
+					<span id="mode-text">Idle</span>
+				</div>
+				
+				<!-- Analytics Dropdown -->
+				
+
+
+<!-- VPN Button -->
+
+<button
+  class="btn-outline nav-btn"
+  onclick="toggleWindow('stats-window')"
+>
+  <i class="fa-solid fa-chart-pie"></i> Analytics
+</button>
+<!-- Control Panel -->
+<button
+  class="btn-outline nav-btn"
+  onclick="toggleWindow('config-window')"
+>
+  <i class="fa-solid fa-gear"></i> Control Panel
+</button>
+			</div>
+		</div>
+
+		<!-- Packet Details Window (Wireshark-style) -->
+		<div
+			id="packet-details-window"
+			class="window draggable"
+			style="display: none"
+		>
+			<div class="window-header">
+				<div class="window-title">
+					<i class="fa-solid fa-microscope"></i> Packet Details
+				</div>
+				<div class="window-controls">
+					<i
+						class="fa-solid fa-minus"
+						onclick="minimizeWindow('packet-details-window')"
+					></i>
+					<i
+						class="fa-solid fa-xmark"
+						onclick="toggleWindow('packet-details-window')"
+					></i>
+				</div>
+			</div>
+			<div
+				class="window-content"
+				id="packetDetailsContent"
+				style="
+					overflow-y: auto;
+					font-family: 'JetBrains Mono', monospace;
+					font-size: 12px;
+				"
+			>
+				<div
+					style="text-align: center; padding: 20px; color: var(--text-muted)"
+				>
+					Select a packet to view details
+				</div>
+			</div>
+		</div>
+
+		<!-- 1. Config Window -->
+		<div id="config-window" class="window draggable">
+			<div class="window-header">
+				<div class="window-title">
+					<i class="fa-solid fa-sliders"></i> Control Panel
+				</div>
+				<div class="window-controls">
+					<i
+						class="fa-solid fa-minus"
+						onclick="minimizeWindow('config-window')"
+					></i>
+				</div>
+			</div>
+			<div class="window-content">
+				
+                <!-- Capture Settings (Unified) -->
+                <h3 class="section-heading">
+                    <i class="fa-solid fa-network-wired"></i> Capture Settings
+                </h3>
+                <div style="margin-bottom: 12px; font-size: 11px;">
+                    <div style="display: flex; gap: 10px; margin-bottom: 10px;">
+                        <label style="flex: 1; cursor: pointer; display: flex; align-items: center; gap: 5px;">
+                            <input type="radio" name="captureMode" value="local" checked onchange="toggleCaptureModeUI()" style="width: auto; margin: 0;"> Local Machine
+                        </label>
+                        <label style="flex: 1; cursor: pointer; display: flex; align-items: center; gap: 5px;">
+                            <input type="radio" name="captureMode" value="switch" onchange="toggleCaptureModeUI()" style="width: auto; margin: 0;"> Switch Monitor
+                        </label>
+                    </div>
+                
+                    <label style="display: block; margin-bottom: 4px; color: var(--text-muted);">Network Interface</label>
+                    <select id="captureInterfaceSelect" style="width: 100%; border-radius: 6px; padding: 6px; margin-bottom: 10px; background: rgba(0,0,0,0.2); color: white; border: 1px solid rgba(255,255,255,0.1);">
+                        <option value="">Loading interfaces...</option>
+                    </select>
+
+                    <div id="captureSubnetContainer" style="display: none; margin-bottom: 10px;">
+                        <label style="display: block; margin-bottom: 4px; color: var(--text-muted);">Monitored Subnet (Switch mode)</label>
+                        <input type="text" id="captureSubnetInput" value="172.16.0.0/16" placeholder="e.g. 172.16.0.0/16" style="width: 100%; border-radius: 6px; padding: 6px; background: rgba(0,0,0,0.2); color: white; border: 1px solid rgba(255,255,255,0.1);" />
+                    </div>
+                </div>
+				<div class="filter-group">
+    <label>Session Duration</label>
+    <select id="sessionDuration">
+        <option value="60">1 Minute</option>
+        <option value="120" selected>2 Minutes</option>
+        <option value="300">5 Minutes</option>
+        <option value="custom">Custom</option>
+    </select>
+</div>
+
+<div class="filter-group" id="customTimeContainer" style="display:none;">
+    <label>Custom Time (seconds)</label>
+    <input type="number" id="customSessionTime" value="120" min="10">
+</div>
+
+                <hr class="cp-divider" />
+<!-- Data Source Section -->
+				<h3 class="section-heading">
+					<i class="fa-solid fa-database"></i> Data Source
+				</h3>
+
+				<!-- Modern Button Grid -->
+				<div
+					style="
+						display: grid;
+						grid-template-columns: 1fr 1fr;
+						gap: 8px;
+						margin-bottom: 12px;
+					"
+				>
+					<button
+						id="liveCaptureBtn"
+						class="btn btn-success"
+						onclick="toggleLiveCapture()"
+					>
+						<i class="fa-solid fa-record-vinyl"></i>
+						<div style="font-size: 10px; margin-top: 2px">Live Capture</div>
+					</button>
+					<button
+						class="btn btn-outline"
+						onclick="document.getElementById('pcapFileInput').click()"
+					>
+						<i class="fa-solid fa-file-import"></i>
+						<div style="font-size: 10px; margin-top: 2px">Load PCAP</div>
+					</button>
+					<button
+						id="pauseCaptureBtn"
+						class="btn btn-outline"
+						onclick="pauseLiveCapture()"
+						style="display: none"
+					>
+						<i class="fa-solid fa-pause"></i>
+						<div style="font-size: 10px; margin-top: 2px">Pause</div>
+					</button>
+					<button
+						id="resetBtn"
+						class="btn btn-outline"
+						onclick="resetEverything()"
+						detectedVPNs.clear();
+					>
+						<i class="fa-solid fa-broom"></i>
+						<div style="font-size: 10px; margin-top: 2px">Reset All</div>
+					</button>
+				</div>
+
+				<!-- Save/Stop Button (full width when active) -->
+				<button
+					id="stopSaveBtn"
+					class="btn btn-danger"
+					onclick="stopAndSaveCapture()"
+					style="display: none; width: 100%; margin-bottom: 12px"
+				>
+					<i class="fa-solid fa-floppy-disk"></i> Stop & Save Capture
+				</button>
+
+				<!-- Hidden file input -->
+				<input
+					type="file"
+					id="pcapFileInput"
+					accept=".pcap,.pcapng"
+					style="display: none"
+					onchange="handlePcapUpload(this)"
+				/>
+
+				<!-- Upload/Load Status -->
+				<div
+					id="uploadStatus"
+					style="
+						font-size: 11px;
+						padding: 8px;
+						border-radius: 6px;
+						display: none;
+						margin-bottom: 12px;
+					"
+				></div>
+
+				<!-- Current Data Info -->
+				<div
+					id="dataInfo"
+					style="
+						display: none;
+						padding: 10px;
+						background: rgba(0, 0, 0, 0.3);
+						border-radius: 8px;
+						font-size: 10px;
+						margin-bottom: 15px;
+					"
+				>
+					<div
+						style="
+							display: flex;
+							justify-content: space-between;
+							margin-bottom: 4px;
+						"
+					>
+						<span style="color: var(--text-muted)">Source:</span>
+						<span id="dataSource" style="font-weight: 600; color: var(--accent)"
+							>-</span
+						>
+					</div>
+					<div style="display: flex; justify-content: space-between">
+						<span style="color: var(--text-muted)">File:</span>
+						<span id="dataFile" style="font-size: 9px; color: var(--text-muted)"
+							>-</span
+						>
+					</div>
+				</div>
+
+				<hr class="cp-divider" />
+
+				<!-- Filters Section -->
+				<h3 class="section-heading">
+					<i class="fa-solid fa-filter"></i> Filters
+				</h3>
+
+				<div class="filter-group">
+					<label for="protocolFilter">Protocol Filter</label>
+					<select id="protocolFilter" onchange="applyFilters()">
+						<option value="">All Protocols</option>
+						<option value="TCP">TCP</option>
+						<option value="UDP">UDP</option>
+					</select>
+				</div>
+
+				<div class="filter-group">
+					<label for="limitInput">Flow Limit</label>
+					<input
+						type="number"
+						id="limitInput"
+						value="100"
+						min="10"
+						max="1000"
+						onchange="applyFilters()"
+					/>
+				</div>
+
+				<div class="filter-group">
+					<label for="minPackets">Min Packets</label>
+					<input
+						type="number"
+						id="minPackets"
+						value="1"
+						min="1"
+						max="100"
+						onchange="applyFilters()"
+					/>
+				</div>
+
+				<button
+					class="btn"
+					onclick="applyFilters()"
+					style="width: 100%; margin-top: 4px"
+				>
+					<i class="fa-solid fa-play"></i> Apply Filters
+				</button>
+
+				<hr class="cp-divider" />
+
+				<!-- Flow List Section -->
+				<div class="flow-list-header">
+					<h3><i class="fa-solid fa-stream"></i> Active Flows</h3>
+					<span id="flowCount" class="badge">0</span>
+				</div>
+				<div id="flowList" class="flow-list-container">
+					<div class="flow-list-empty">
+						<i class="fa-solid fa-inbox"></i>
+						No data loaded
+					</div>
+				</div>
+
+				<hr class="cp-divider" />
+
+				<!-- Recent Packets Section (for both modes) -->
+				<div id="recentPacketsSection" style="display: none">
+					<div class="flow-list-header">
+						<h3><i class="fa-solid fa-list"></i> Recent Packets</h3>
+						<span
+							id="packetCount"
+							class="badge"
+							style="background: rgba(34, 197, 94, 0.15); color: var(--success)"
+							>0</span
+						>
+					</div>
+					<div
+						class="flow-list-container"
+						style="height: auto; max-height: 300px"
+					>
+						<table
+							style="
+								width: 100%;
+								border-collapse: collapse;
+								font-family: 'JetBrains Mono', monospace;
+								font-size: 11px;
+							"
+						>
+							<thead
+								style="
+									position: sticky;
+									top: 0;
+									background: rgba(15, 23, 42, 0.95);
+									z-index: 1;
+								"
+							>
+								<tr
+									style="
+										text-align: left;
+										color: var(--text-muted);
+										border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+									"
+								>
+									<th style="padding: 6px">#</th>
+									<th style="padding: 6px">Time</th>
+									<th style="padding: 6px">Src</th>
+									<th style="padding: 6px">Dst</th>
+									<th style="padding: 6px">P</th>
+									<th style="padding: 6px">Len</th>
+								</tr>
+							</thead>
+							<tbody id="packetTableBody">
+								<tr>
+									<td
+										colspan="6"
+										style="
+											text-align: center;
+											padding: 15px;
+											color: var(--text-muted);
+										"
+									>
+										No packets yet
+									</td>
+								</tr>
+							</tbody>
+						</table>
+					</div>
+				</div>
+			</div>
+		</div>
+
+		<!-- 2. Stats Window -->
+		<div id="stats-window" class="window draggable" style="display: flex;">
+			<div class="window-header">
+				<div class="window-title">
+					<i class="fa-solid fa-chart-pie"></i> Analytics
+				</div>
+				<div class="window-controls">
+					<i
+						class="fa-solid fa-minus"
+						onclick="minimizeWindow('stats-window')"
+					></i>
+				</div>
+			</div>
+			
+
+			<div class="window-content">
+				<div
+					style="
+						display: grid;
+						grid-template-columns: 1fr 1fr;
+						gap: 12px;
+						margin-bottom: 18px;
+					"
+				>
+					<div
+						style="
+							background: rgba(255, 255, 255, 0.05);
+							padding: 14px;
+							border-radius: 10px;
+							text-align: center;
+						"
+					>
+						<div id="totalPackets" style="font-size: 24px; font-weight: 700">
+							-
+						</div>
+						<div style="font-size: 12px; color: var(--text-muted)">
+							Total Packets
+						</div>
+					</div>
+					<div
+						style="
+							background: rgba(255, 255, 255, 0.05);
+							padding: 14px;
+							border-radius: 10px;
+							text-align: center;
+						"
+					>
+						<div
+							id="uniqueSrc"
+							style="font-size: 24px; font-weight: 700; color: var(--accent)"
+						>
+							-
+						</div>
+						<div style="font-size: 12px; color: var(--text-muted)">
+							Unique IPs
+						</div>
+					</div>
+					<div
+						style="
+							background: rgba(255, 255, 255, 0.05);
+							padding: 14px;
+							border-radius: 10px;
+							text-align: center;
+						"
+					>
+						<div
+							id="totalBytes"
+							style="font-size: 20px; font-weight: 700; color: #22c55e"
+						>
+							-
+						</div>
+						<div style="font-size: 12px; color: var(--text-muted)">
+							Total Data
+						</div>
+					</div>
+					<div
+						style="
+							background: rgba(255, 255, 255, 0.05);
+							padding: 14px;
+							border-radius: 10px;
+							text-align: center;
+						"
+					>
+						<div
+							id="avgPacketSize"
+							style="font-size: 20px; font-weight: 700; color: #f59e0b"
+						>
+							-
+						</div>
+						<div style="font-size: 12px; color: var(--text-muted)">
+							Avg Packet
+						</div>
+					</div>
+					<div
+						style="
+							background: rgba(255, 255, 255, 0.05);
+							padding: 14px;
+							border-radius: 10px;
+							text-align: center;
+						"
+					>
+						<div
+							id="duration"
+							style="font-size: 20px; font-weight: 700; color: #8b5cf6"
+						>
+							-
+						</div>
+						<div style="font-size: 12px; color: var(--text-muted)">
+							Duration
+						</div>
+					</div>
+					<div
+						style="
+							background: rgba(255, 255, 255, 0.05);
+							padding: 14px;
+							border-radius: 10px;
+							text-align: center;
+						"
+					>
+						<div
+							id="packetRate"
+							style="font-size: 20px; font-weight: 700; color: #ec4899"
+						>
+							-
+						</div>
+						<div style="font-size: 12px; color: var(--text-muted)">
+							Packets/sec
+						</div>
+					</div>
+					<div
+						style="
+							background: rgba(255, 255, 255, 0.05);
+							padding: 14px;
+							border-radius: 10px;
+							text-align: center;
+						"
+					>
+						<div
+							id="unknownLocations"
+							style="font-size: 20px; font-weight: 700; color: #ef4444"
+						>
+							-
+						</div>
+						<div style="font-size: 12px; color: var(--text-muted)">
+							Unknown Locs
+						</div>
+					</div>
+					<div
+						style="
+							background: rgba(255, 255, 255, 0.05);
+							padding: 14px;
+							border-radius: 10px;
+							text-align: center;
+						"
+					>
+						<div
+							id="vpnIpsCount"
+							style="font-size: 20px; font-weight: 700; color: #f59e0b"
+						>
+							-
+						</div>
+						<div style="font-size: 12px; color: var(--text-muted)">
+							&#x1F512; VPN IPs
+						</div>
+					</div>
+				</div>
+
+				<!-- VPN Monitor Window -->
+
+
+				<div style="margin-bottom: 18px">
+					<h4
+						style="
+							font-size: 13px;
+							margin-bottom: 10px;
+							color: var(--text-muted);
+							text-transform: uppercase;
+						"
+					>
+						Top Talkers (by traffic)
+					</h4>
+					<div
+						id="topTalkers"
+						style="
+							font-size: 13px;
+							max-height: 140px;
+							overflow-y: auto;
+							background: rgba(0, 0, 0, 0.2);
+							border-radius: 8px;
+							padding: 10px;
+						"
+					>
+						<div
+							style="
+								text-align: center;
+								padding: 10px;
+								color: var(--text-muted);
+							"
+						>
+							Loading...
+						</div>
+					</div>
+				</div>
+
+				<div style="margin-bottom: 18px">
+					<h4
+						style="
+							font-size: 13px;
+							margin-bottom: 10px;
+							color: var(--text-muted);
+							text-transform: uppercase;
+						"
+					>
+						Top Destination Ports
+					</h4>
+					<div
+						id="topPorts"
+						style="
+							font-size: 13px;
+							max-height: 140px;
+							overflow-y: auto;
+							background: rgba(0, 0, 0, 0.2);
+							border-radius: 8px;
+							padding: 10px;
+						"
+					>
+						<div
+							style="
+								text-align: center;
+								padding: 10px;
+								color: var(--text-muted);
+							"
+						>
+							Loading...
+						</div>
+					</div>
+				</div>
+
+				<div>
+					<h4
+						style="
+							font-size: 13px;
+							margin-bottom: 10px;
+							color: var(--text-muted);
+							text-transform: uppercase;
+						"
+					>
+						Protocol Distribution
+					</h4>
+					<div
+						id="protocolDist"
+						style="
+							font-size: 13px;
+							max-height: 120px;
+							overflow-y: auto;
+							background: rgba(0, 0, 0, 0.2);
+							border-radius: 8px;
+							padding: 10px;
+						"
+					>
+						<div
+							style="
+								text-align: center;
+								padding: 10px;
+								color: var(--text-muted);
+							"
+						>
+							Loading...
+						</div>
+					</div>
+				</div>
+			</div>
+		</div>
+   <div id="vpn-panel" class="window">
+    <div class="window-header">
+        <div class="window-title">
+            <i class="fa-solid fa-shield-halved"></i> VPN Detections
+        </div>
+    </div>
+
+    <div class="window-content" id="vpnLiveList">
+            <div style="text-align:center; color: var(--text-muted)">
+                No VPN detected
+            </div>
+        
+    </div>
+</div>
+		<!-- 3. DPI Details Modal -->
+		<div id="details-window" class="window">
+			<div class="window-header">
+				<div class="window-title">
+					<i class="fa-solid fa-microchip"></i> Packet Inspector
+				</div>
+				<div class="window-controls">
+					<i
+						class="fa-solid fa-minus"
+						onclick="minimizeWindow('details-window')"
+					></i>
+					<i
+						class="fa-solid fa-xmark"
+						onclick="
+							document.getElementById('details-window').style.display = 'none'
+						"
+					></i>
+				</div>
+			</div>
+			<div class="window-content">
+				<table
+					style="
+						width: 100%;
+						border-collapse: collapse;
+						font-family: 'JetBrains Mono', monospace;
+						font-size: 11px;
+					"
+				>
+					<thead>
+						<tr style="text-align: left; color: var(--text-muted)">
+							<th style="padding: 8px">#</th>
+							<th style="padding: 8px">Time</th>
+							<th style="padding: 8px">Proto</th>
+							<th style="padding: 8px">Len</th>
+							<th style="padding: 8px">TTL</th>
+						</tr>
+					</thead>
+					<tbody id="packetTableBody"></tbody>
+				</table>
+			</div>
+		</div>
+
+		<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+		<script>
+			// ============================================================================
+			// GLOBAL VARIABLES
+			// ============================================================================
+			let sessionTimeout = null;
+let sessionInterval = null;
+let sessionActive = false;
+			let detectedVPNs = new Set();
+			const map = L.map('map', {
+				zoomControl: false,
+				attributionControl: false,
+			}).setView([20, 0], 2);
+			L.tileLayer(
+				'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
+				{ maxZoom: 19 },
+			).addTo(map);
+
+			let flowLines = [];
+			let markers = [];
+			let liveMarkers = {};
+			let livePaths = [];
+			let socket = null;
+			let liveMode = false;
+			let pcapMode = false;
+
+			// ============================================================================
+			// MODE MANAGEMENT
+			// ============================================================================
+			function updateModeIndicator(mode, text) {
+				const indicator = document.getElementById('mode-status');
+				const modeText = document.getElementById('mode-text');
+				indicator.className = 'mode-indicator ' + mode;
+				modeText.textContent = text;
+			}
+
+			
+			function toggleCaptureModeUI() {
+				const mode = document.querySelector('input[name="captureMode"]:checked').value;
+				document.getElementById('captureSubnetContainer').style.display = (mode === 'switch') ? 'block' : 'none';
+			}
+
+			async function loadInterfaces() {
+				try {
+					const res = await fetch('/api/interfaces');
+					const data = await res.json();
+					const sel = document.getElementById('captureInterfaceSelect');
+					if (data.interfaces && data.interfaces.length > 0) {
+						sel.innerHTML = '<option value="">Default (All Interfaces)</option>';
+						data.interfaces.forEach(iface => {
+							let label = iface.name;
+							if (iface.description && iface.description !== iface.name) {
+								label += ` - ${iface.description}`;
+							}
+							if (iface.ips && iface.ips.length > 0) {
+								label += ` (${iface.ips[0]})`;
+							}
+							let icon = iface.is_wifi ? '📶 ' : iface.is_ethernet ? '🔌 ' : '';
+							sel.innerHTML += `<option value="${iface.name}">${icon}${label}</option>`;
+						});
+					} else {
+						sel.innerHTML = '<option value="">No interfaces found</option>';
+					}
+				} catch(e) {
+					console.error("Error loading interfaces:", e);
+				}
+			}
+            
+			document.addEventListener('DOMContentLoaded', () => {
+				loadInterfaces();
+				document.getElementById("sessionDuration").addEventListener("change", function () {
+    const customBox = document.getElementById("customTimeContainer");
+
+    if (this.value === "custom") {
+        customBox.style.display = "block";
+    } else {
+        customBox.style.display = "none";
+    }
+});
+			});
+
+			async function checkMode() {
+				try {
+					const res = await fetch('/api/mode');
+					const data = await res.json();
+
+					if (data.live_capture) {
+						pcapMode = false;
+						liveMode = true;
+						updateModeIndicator('live', 'Live Capture');
+						document.getElementById('recentPacketsSection').style.display =
+							'block';
+					} else if (data.has_parquet) {
+						pcapMode = true;
+						liveMode = false;
+						updateModeIndicator('pcap', 'PCAP Analysis');
+						document.getElementById('recentPacketsSection').style.display =
+							'none';
+						// document.getElementById('stats-window').style.display = 'flex';
+						loadFlows();
+					} else {
+						updateModeIndicator('', 'Idle');
+						document.getElementById('recentPacketsSection').style.display =
+							'none';
+					}
+				} catch (e) {
+					console.error('Error checking mode:', e);
+				}
+			}
+
+			// ============================================================================
+			// LIVE CAPTURE (WEBSOCKET)
+			// ============================================================================
+			function initWebSocket() {
+				if (socket) return;
+
+				socket = io.connect(window.location.origin);
+
+				socket.on('connect', function () {
+					console.log('WebSocket connected');
+				});
+
+				socket.on('disconnect', function () {
+					console.log('WebSocket disconnected');
+				});
+
+				socket.on('new_packet', function (packet) {
+					handleLivePacket(packet);
+				});
+
+				// Switch monitoring events
+				socket.on('switch_vpn_alert', function (alert) {
+					console.log('[SWITCH-VPN-ALERT]', alert);
+					const alertCountEl = document.getElementById('swAlerts');
+					if (alertCountEl) {
+						alertCountEl.textContent =
+							parseInt(alertCountEl.textContent || '0') + 1;
+					}
+					const vpnTab = document.getElementById('swTabVpn');
+					if (vpnTab) {
+						vpnTab.style.background = 'rgba(239,68,68,0.3)';
+						setTimeout(() => {
+							vpnTab.style.background = '';
+						}, 1000);
+					}
+					refreshSwitchData();
+				});
+
+				socket.on('switch_device_update', function (device) {
+					const devCountEl = document.getElementById('swDevices');
+					if (devCountEl) refreshSwitchData();
+				});
+
+				socket.on('switch_new_packet', function(packet) { handleLivePacket(packet); });
+
+				socket.on('switch_packet_geo', function (pkt) {
+					// Legacy handler — now handled via switch_new_packet
+				});
+			}
+
+			function handleLivePacket(packet) {
+				if (!liveMode || capturePaused) return;
+              console.log("PACKET:", packet);
+				// Update packet list
+				updateLivePacketList(packet);
+
+				// Update live stats if visible
+				updateLiveStatsDisplay();
+
+				// Check if packet involves local IP
+				const isLocalSrc = localIPs.includes(packet.src_location.ip);
+				const isLocalDst = localIPs.includes(packet.dst_location.ip);
+				const isLocalPacket = isLocalSrc || isLocalDst;
+
+				// Add markers for source and destination
+				addLiveMarker(packet.src_location, packet.protocol, isLocalSrc);
+				addLiveMarker(packet.dst_location, packet.protocol, isLocalDst);
+   if (packet.src_location?.is_vpn || packet.src_location?.vpn) {
+    addVpnEntry(packet.src_location);
+}
+
+if (packet.dst_location?.is_vpn || packet.dst_location?.vpn) {
+    addVpnEntry(packet.dst_location);
+}
+				// Draw path with animated dashed lines
+				const color = isLocalPacket
+					? '#38bdf8'
+					: packet.protocol === 'TCP'
+						? '#3b82f6'
+						: '#8b5cf6';
+				const weight = isLocalPacket ? 2 : 1;
+				const opacity = isLocalPacket ? 0.8 : 0.5;
+
+				const line = L.polyline(
+					[
+						[packet.src_location.lat, packet.src_location.lon],
+						[packet.dst_location.lat, packet.dst_location.lon],
+					],
+					{
+						color: '#38bdf8', // keep or change
+                        weight: 2,
+                        opacity: 0.8,
+                        dashArray: '6, 8',   // smoother dots
+                        dashOffset: '0',
+					},
+				).addTo(map);
+
+				// Animate the line by updating dashOffset
+				let offset = 0;
+				const animateLine = setInterval(() => {
+					if (!liveMode) {
+						clearInterval(animateLine);
+						return;
+					}
+					offset += 0.5;
+					if (offset > 20) offset = 0;
+					line.setStyle({ dashOffset: offset.toString() });
+				}, 50);
+
+				livePaths.push(line);
+
+				// Don't limit paths - keep them until cleared manually
+			}
+
+			function updateLiveStatsDisplay() {
+				// This will be called from server via socket if needed
+				// Or we can track locally
+			}
+
+			function addLiveMarker(location, protocol, isLocal = false) {
+				const key = `${location.lat},${location.lon}`;
+
+				if (!liveMarkers[key]) {
+					const isVpn = location.is_vpn || false;
+					const color = isVpn
+						? '#ef4444'
+						: isLocal
+							? '#38bdf8'
+							: protocol === 'TCP'
+								? '#3b82f6'
+								: '#8b5cf6';
+					const radius = isVpn ? 6 : isLocal ? 5 : 4;
+
+					const marker = L.circleMarker([location.lat, location.lon], {
+						radius: radius,
+						fillColor: color,
+						color: isVpn
+							? 'rgba(239,68,68,0.35)'
+							: isLocal
+								? 'rgba(56,189,248,0.3)'
+								: 'rgba(255,255,255,0.15)',
+						weight: isVpn ? 8 : isLocal ? 7 : 5,
+						opacity: isVpn ? 0.25 : isLocal ? 0.25 : 0.15,
+						fillOpacity: 1,
+						className: isVpn ? 'vpn-marker' : isLocal ? 'local-ip-marker' : '',
+					}).addTo(map);
+
+					const localLabel = isLocal
+						? '<span style="color: #22c55e; font-weight: bold;">🏠 YOUR IP</span><br>'
+						: '';
+					const vpnLabel = isVpn
+						? `<span style="color:#ef4444;font-weight:700;">⛔ VPN — ${location.vpn_provider || 'Detected'}</span><br>`
+						: '';
+					marker.bindPopup(`
+                    <div style="color: #000; font-size: 11px; min-width: 130px;">
+                        ${localLabel}${vpnLabel}
+                        <strong>${location.city}, ${location.country}</strong><br>
+                        IP: ${location.ip}<br>
+                        ${location.isp ? 'ISP: ' + location.isp + '<br>' : ''}
+                        ${location.asn ? 'ASN: ' + location.asn : ''}
+                    </div>
+                `);
+
+					liveMarkers[key] = marker;
+				}
+			}
+
+			let capturePaused = false;
+
+			async function fetchLocalIPs() {
+				try {
+					const res = await fetch('/api/local_ips');
+					const data = await res.json();
+					localIPs = data.local_ips || [];
+					if (localIPs.length > 0) {
+						console.log('Local IPs detected:', localIPs);
+						// Auto-detect subnet for switch mode
+						const firstIP = localIPs[0];
+						const parts = firstIP.split('.');
+						if (parts.length === 4) {
+							const subnet = parts[0] + '.' + parts[1] + '.' + parts[2] + '.0/24';
+							const subnetInput = document.getElementById('captureSubnetInput');
+							if (subnetInput && subnetInput.value === '172.16.0.0/16') {
+								subnetInput.value = subnet;
+							}
+						}
+					}
+				} catch (e) {
+					console.error('Error fetching local IPs:', e);
+				}
+			}
+
+			async function toggleLiveCapture() {
+				const btn = document.getElementById('liveCaptureBtn');
+				const pauseBtn = document.getElementById('pauseCaptureBtn');
+				const stopBtn = document.getElementById('stopSaveBtn');
+
+				if (!liveMode) {
+					await fetchLocalIPs();
+                    // Get form data
+                    const mode = document.querySelector('input[name="captureMode"]:checked').value;
+                    const iface = document.getElementById('captureInterfaceSelect').value;
+                    const subnet = document.getElementById('captureSubnetInput').value;
+
+					// Start capture
+					try {
+                        const res = await fetch('/api/capture/start', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ mode: mode, interface: iface, subnet: subnet })
+                        });
+						const data = await res.json();
+
+						if (
+							data.status === 'started' ||
+							data.status === 'already_running'
+						) {
+							liveMode = true;
+							capturePaused = false;
+							startSessionLimit();
+
+							// Update buttons
+							btn.innerHTML =
+								'<i class="fa-solid fa-circle" style="color: #ef4444;"></i><div style="font-size: 10px; margin-top: 2px;">Recording</div>';
+							btn.className = 'btn btn-danger';
+							btn.disabled = true;
+							pauseBtn.style.display = 'block';
+							stopBtn.style.display = 'block';
+
+							updateModeIndicator('live', 'Live Capture');
+
+							// Update data info
+							document.getElementById('dataInfo').style.display = 'block';
+							document.getElementById('dataSource').textContent =
+								'Live Capture';
+							document.getElementById('dataFile').textContent =
+								new Date().toLocaleString();
+
+							// Show packets section
+							document.getElementById('recentPacketsSection').style.display =
+								'block';
+
+							// Clear all existing data
+							resetEverything(false);
+
+							// Show analytics window
+						//	document.getElementById('stats-window').style.display = 'flex';
+
+							// Init WebSocket
+							initWebSocket();
+
+							// Start stats update
+							updateLiveStats();
+						}
+					} catch (e) {
+						console.error('Error starting capture:', e);
+						alert(
+							'Failed to start live capture. Make sure you run as Administrator/sudo!',
+						);
+					}
+				}
+			}
+
+			async function pauseLiveCapture() {
+				const pauseBtn = document.getElementById('pauseCaptureBtn');
+
+				if (!capturePaused) {
+					// Pause
+					capturePaused = true;
+					pauseBtn.innerHTML =
+						'<i class="fa-solid fa-play"></i><div style="font-size: 10px; margin-top: 2px;">Resume</div>';
+					pauseBtn.className = 'btn btn-success';
+					updateModeIndicator('live', 'Live Capture (Paused)');
+				} else {
+					// Resume
+					capturePaused = false;
+					pauseBtn.innerHTML =
+						'<i class="fa-solid fa-pause"></i><div style="font-size: 10px; margin-top: 2px;">Pause</div>';
+					pauseBtn.className = 'btn btn-outline';
+					updateModeIndicator('live', 'Live Capture');
+				}
+			}
+
+			async function stopAndSaveCapture() {
+				if (sessionTimeout) clearTimeout(sessionTimeout);
+if (sessionInterval) clearInterval(sessionInterval);
+
+sessionActive = false;
+
+const display = document.getElementById("sessionTimerText");
+if (display) display.textContent = "";
+				const btn = document.getElementById('liveCaptureBtn');
+				const pauseBtn = document.getElementById('pauseCaptureBtn');
+				const stopBtn = document.getElementById('stopSaveBtn');
+
+				try {
+					stopBtn.disabled = true;
+					stopBtn.innerHTML =
+						'<i class="fa-solid fa-spinner fa-spin"></i> Saving...';
+
+					const res = await fetch('/api/capture/stop');
+					const data = await res.json();
+
+					liveMode = false;
+					capturePaused = false;
+
+					// Reset buttons
+					btn.innerHTML =
+						'<i class="fa-solid fa-record-vinyl"></i><div style="font-size: 10px; margin-top: 2px;">Live Capture</div>';
+					btn.className = 'btn btn-success';
+					btn.disabled = false;
+					pauseBtn.style.display = 'none';
+					pauseBtn.innerHTML =
+						'<i class="fa-solid fa-pause"></i><div style="font-size: 10px; margin-top: 2px;">Pause</div>';
+					pauseBtn.className = 'btn btn-outline';
+					stopBtn.style.display = 'none';
+					stopBtn.disabled = false;
+					stopBtn.innerHTML =
+						'<i class="fa-solid fa-floppy-disk"></i> Stop & Save Capture';
+
+					updateModeIndicator('', 'Idle');
+
+					// Show save result
+					if (data.saved) {
+						const statusDiv = document.getElementById('uploadStatus');
+						statusDiv.style.display = 'block';
+						statusDiv.style.background = 'rgba(34, 197, 94, 0.2)';
+						statusDiv.style.border = '1px solid rgba(34, 197, 94, 0.3)';
+						statusDiv.style.color = 'var(--success)';
+						statusDiv.innerHTML = `<i class="fa-solid fa-circle-check"></i> Saved ${data.packet_count} packets to ${data.pcap_file.split('/').pop()}`;
+
+						// Auto-load the saved file
+						if (data.parquet_file) {
+							setTimeout(() => {
+								statusDiv.style.display = 'none';
+								// Don't auto-load, let user decide
+							}, 5000);
+						}
+					}
+				} catch (e) {
+					console.error('Error stopping capture:', e);
+					stopBtn.disabled = false;
+					stopBtn.innerHTML =
+						'<i class="fa-solid fa-floppy-disk"></i> Stop & Save Capture';
+				}
+			}
+
+			function resetEverything(showConfirm = true) {
+				if (
+					showConfirm &&
+					!confirm(
+						'Reset everything? This will clear all visualizations and data.',
+					)
+				) {
+					return;
+				}
+
+				// Clear map
+				clearPcapVisualizations();
+				clearLiveVisualizations();
+
+				// Clear flow list
+				document.getElementById('flowList').innerHTML =
+					'<div style="text-align: center; padding: 20px; color: var(--text-muted); font-size: 11px;"><i class="fa-solid fa-inbox" style="font-size: 24px; opacity: 0.3; display: block; margin-bottom: 8px;"></i>No data loaded</div>';
+				document.getElementById('flowCount').textContent = '0';
+
+				// Clear packet list
+				document.getElementById('packetTableBody').innerHTML =
+					'<tr><td colspan="6" style="text-align: center; padding: 15px; color: var(--text-muted);">No packets yet</td></tr>';
+				document.getElementById('packetCount').textContent = '0';
+
+				// Reset stats (with null checks)
+				const statsElements = [
+					'totalPackets',
+					'uniqueSrc',
+					'totalBytes',
+					'avgPacketSize',
+					'duration',
+					'packetRate',
+					'unknownLocations',
+					'vpnIpsCount',
+				];
+				statsElements.forEach((id) => {
+					const el = document.getElementById(id);
+					if (el) el.textContent = '-';
+				});
+
+				const topTalkersEl = document.getElementById('topTalkers');
+				const topPortsEl = document.getElementById('topPorts');
+				const protocolDistEl = document.getElementById('protocolDist');
+				if (topTalkersEl)
+					topTalkersEl.innerHTML =
+						'<div style="text-align: center; padding: 10px; color: var(--text-muted);">No data</div>';
+				if (topPortsEl)
+					topPortsEl.innerHTML =
+						'<div style="text-align: center; padding: 10px; color: var(--text-muted);">No data</div>';
+				if (protocolDistEl)
+					protocolDistEl.innerHTML =
+						'<div style="text-align: center; padding: 10px; color: var(--text-muted);">No data</div>';
+				const vpnDetailsEl = document.getElementById('vpnDetails');
+				if (vpnDetailsEl)
+					vpnDetailsEl.innerHTML =
+						'<div style="text-align: center; padding: 10px; color: var(--text-muted);">No VPN detected</div>';
+
+				// Hide sections
+				if (!liveMode) {
+					document.getElementById('recentPacketsSection').style.display =
+						'none';
+					document.getElementById('dataInfo').style.display = 'none';
+				}
+
+				// Hide status
+				document.getElementById('uploadStatus').style.display = 'none';
+
+				if (showConfirm) {
+					updateModeIndicator('', 'Idle');
+				}
+			}
+
+			function applyFilters() {
+				if (liveMode) {
+					// For live capture, filters apply to display only
+					alert('Live capture mode: filters will apply on next refresh');
+				} else if (pcapMode) {
+					// For PCAP mode, reload with filters
+					loadFlows();
+				} else {
+					alert('Please load data first');
+				}
+			}
+
+			async function updateLiveStats() {
+				if (!liveMode) return;
+
+				try {
+					const res = await fetch('/api/live/stats');
+					const data = await res.json();
+
+					// Update analytics window (with null checks)
+					const totalPacketsEl = document.getElementById('totalPackets');
+					const uniqueSrcEl = document.getElementById('uniqueSrc');
+					const totalBytesEl = document.getElementById('totalBytes');
+					const bandwidthEl = document.getElementById('bandwidth');
+
+					if (totalPacketsEl) totalPacketsEl.textContent = data.total_packets;
+					if (uniqueSrcEl) uniqueSrcEl.textContent = data.unique_ips;
+
+					// Format bandwidth
+					let bandwidth = data.bandwidth_bps;
+					let bwUnit = 'B/s';
+					if (bandwidth > 1024 * 1024) {
+						bandwidth = (bandwidth / (1024 * 1024)).toFixed(2);
+						bwUnit = 'MB/s';
+					} else if (bandwidth > 1024) {
+						bandwidth = (bandwidth / 1024).toFixed(2);
+						bwUnit = 'KB/s';
+					} else {
+						bandwidth = bandwidth.toFixed(0);
+					}
+
+					// Format total bytes
+					let totalBytes = data.total_bytes;
+					let byteUnit = 'B';
+					if (totalBytes > 1024 * 1024 * 1024) {
+						totalBytes = (totalBytes / (1024 * 1024 * 1024)).toFixed(2);
+						byteUnit = 'GB';
+					} else if (totalBytes > 1024 * 1024) {
+						totalBytes = (totalBytes / (1024 * 1024)).toFixed(2);
+						byteUnit = 'MB';
+					} else if (totalBytes > 1024) {
+						totalBytes = (totalBytes / 1024).toFixed(2);
+						byteUnit = 'KB';
+					}
+					if (totalBytesEl)
+						totalBytesEl.textContent = totalBytes + ' ' + byteUnit;
+					if (bandwidthEl) bandwidthEl.textContent = bandwidth + ' ' + bwUnit;
+
+					// Update top talkers
+					const topTalkersDiv = document.getElementById('topTalkers');
+					if (
+						topTalkersDiv &&
+						data.top_talkers &&
+						data.top_talkers.length > 0
+					) {
+						topTalkersDiv.innerHTML = data.top_talkers
+							.map((t, i) => {
+								const mb = (t.bytes / (1024 * 1024)).toFixed(2);
+								return `<div style="padding: 4px; border-bottom: 1px solid rgba(255,255,255,0.05); display: flex; justify-content: space-between;">
+                            <span>${i + 1}. ${t.ip}</span>
+                            <span style="color: var(--accent);">${mb} MB</span>
+                        </div>`;
+							})
+							.join('');
+					} else if (topTalkersDiv) {
+						topTalkersDiv.innerHTML =
+							'<div style="text-align: center; padding: 10px; color: var(--text-muted);">No data yet</div>';
+					}
+
+					// Update top ports
+					const topPortsDiv = document.getElementById('topPorts');
+					if (topPortsDiv && data.top_ports && data.top_ports.length > 0) {
+						topPortsDiv.innerHTML = data.top_ports
+							.map((p, i) => {
+								return `<div style="padding: 4px; border-bottom: 1px solid rgba(255,255,255,0.05); display: flex; justify-content: space-between;">
+                            <span>${i + 1}. Port ${p.port}</span>
+                            <span style="color: var(--accent);">${p.count} pkts</span>
+                        </div>`;
+							})
+							.join('');
+					} else if (topPortsDiv) {
+						topPortsDiv.innerHTML =
+							'<div style="text-align: center; padding: 10px; color: var(--text-muted);">No data yet</div>';
+					}
+
+					// VPN IPs count
+					const vpnIpsEl = document.getElementById('vpnIpsCount');
+					if (vpnIpsEl) {
+						vpnIpsEl.innerText = data.vpn_ips_count || 0;
+					}
+
+					// VPN Details
+					const vpnDetailsDiv = document.getElementById('vpnDetails');
+					if (
+						vpnDetailsDiv &&
+						data.vpn_details &&
+						data.vpn_details.length > 0
+					) {
+						vpnDetailsDiv.innerHTML = data.vpn_details
+							.map((v) => {
+								const dir = v.direction === 'source' ? '&#x2192;' : '&#x2190;';
+								const dirLabel = v.direction === 'source' ? 'SRC' : 'DST';
+								const dirColor =
+									v.direction === 'source' ? '#ef4444' : '#3b82f6';
+								const methodLabels = {
+									keyword: 'ISP Match',
+									asn_database: 'ASN DB',
+									ip_database: 'IP List (X4BNet)',
+									'vpnapi.io': 'vpnapi.io',
+									'ip-api-proxy': 'ip-api Proxy',
+								};
+								const methodLabel =
+									methodLabels[v.method] || v.method || 'Unknown';
+								return `<div style="padding: 6px 8px; border-bottom: 1px solid rgba(245,158,11,0.1); line-height: 1.5;">
+								<div style="display: flex; justify-content: space-between; align-items: center;">
+									<span style="color: #f59e0b; font-weight: 600;">${v.provider}</span>
+									<div>
+										<span style="color: #a78bfa; font-size: 8px; background: rgba(167,139,250,0.1); padding: 1px 5px; border-radius: 3px; margin-right: 4px;" title="Detection method">${methodLabel}</span>
+										<span style="color: ${dirColor}; font-size: 9px; background: rgba(255,255,255,0.05); padding: 1px 6px; border-radius: 3px;">${dirLabel}</span>
+									</div>
+								</div>
+								<div style="color: var(--text-secondary); margin-top: 2px;">
+									<span style="color: #22c55e;">${v.ip}</span>
+									${v.peer_ip ? ` ${dir} <span style="color: #94a3b8;">${v.peer_ip}</span>` : ''}
+								</div>
+								<div style="color: var(--text-muted); margin-top: 1px;">
+									ISP: ${v.isp} &middot; ${v.city}, ${v.country}
+								</div>
+							</div>`;
+							})
+							.join('');
+					} else if (vpnDetailsDiv) {
+						vpnDetailsDiv.innerHTML =
+							'<div style="text-align: center; padding: 10px; color: var(--text-muted);">No VPN detected</div>';
+					}
+
+					// Unknown locations
+					const unknownLocEl = document.getElementById('unknownLocations');
+					if (unknownLocEl) {
+						unknownLocEl.innerText = data.unknown_locations || 0;
+					}
+
+					// Protocol distribution
+					const protocolDistDiv = document.getElementById('protocolDist');
+					if (protocolDistDiv && data.protocols) {
+						const protoEntries = Object.entries(data.protocols);
+						if (protoEntries.length > 0) {
+							const totalProto = protoEntries.reduce((s, e) => s + e[1], 0);
+							protocolDistDiv.innerHTML = protoEntries
+								.map((p, i) => {
+									const pct = ((p[1] / totalProto) * 100).toFixed(1);
+									return `<div style="padding: 4px 6px; border-bottom: 1px solid rgba(255,255,255,0.05); display: flex; justify-content: space-between; align-items: center;">
+									<span style="flex: 1;">${p[0]}</span>
+									<span style="color: var(--accent); font-size: 9px; margin-left: 8px;">${p[1]} pkts</span>
+									<span style="color: #8b5cf6; font-size: 9px; margin-left: 8px;">${pct}%</span>
+								</div>`;
+								})
+								.join('');
+						} else {
+							protocolDistDiv.innerHTML =
+								'<div style="text-align: center; padding: 10px; color: var(--text-muted);">No data yet</div>';
+						}
+					}
+				} catch (e) {
+					console.error('Error fetching live stats:', e);
+				}
+
+				// Update every 2 seconds
+				setTimeout(updateLiveStats, 2000);
+			}
+
+			async function saveLiveCapture() {
+				try {
+					const res = await fetch('/api/live/save');
+					const data = await res.json();
+
+					if (data.status === 'success' || data.status === 'partial') {
+						alert(
+							`✅ ${data.message}\\n\\nSaved to: ${data.pcap_file}${data.parquet_file ? '\\nParquet: ' + data.parquet_file : ''}`,
+						);
+					} else {
+						alert('❌ Error: ' + (data.error || 'Unknown error'));
+					}
+				} catch (e) {
+					console.error('Error saving capture:', e);
+					alert('❌ Failed to save capture: ' + e.message);
+				}
+			}
+
+			async function loadSavedCapture() {
+				if (
+					confirm(
+						'This will load the most recent saved capture for analysis. Continue?',
+					)
+				) {
+					try {
+						// Show loading indicator
+						const btn = event.target;
+						const originalText = btn.innerHTML;
+						btn.disabled = true;
+						btn.innerHTML =
+							'<i class="fa-solid fa-spinner fa-spin"></i> Converting & Loading...';
+
+						const res = await fetch('/api/live/load_saved');
+						const data = await res.json();
+
+						btn.disabled = false;
+						btn.innerHTML = originalText;
+
+						if (data.status === 'success') {
+							alert(
+								`✅ ${data.message}\n\nPCAP: ${data.pcap_file}\nParquet: ${data.parquet_file}\n\nYou can now use the chatbot and analytics!`,
+							);
+							// Reload page to switch mode
+							location.reload();
+						} else {
+							alert('❌ Error: ' + (data.error || 'Unknown error'));
+						}
+					} catch (e) {
+						console.error('Error loading saved capture:', e);
+						alert('❌ Failed to load capture: ' + e.message);
+					}
+				}
+			}
+
+			function clearLiveVisualizations() {
+				livePaths.forEach((l) => map.removeLayer(l));
+				Object.values(liveMarkers).forEach((m) => map.removeLayer(m));
+				livePaths = [];
+				liveMarkers = {};
+			}
+
+			function clearPcapVisualizations() {
+				flowLines.forEach((l) => map.removeLayer(l));
+				markers.forEach((m) => map.removeLayer(m));
+				flowLines = [];
+				markers = [];
+			}
+
+			// ============================================================================
+			// FILE UPLOAD HANDLER
+			// ============================================================================
+			async function handlePcapUpload(input) {
+				const file = input.files[0];
+				if (!file) return;
+
+				const statusDiv = document.getElementById('uploadStatus');
+				statusDiv.style.display = 'block';
+				statusDiv.style.background = 'rgba(56, 189, 248, 0.2)';
+				statusDiv.style.border = '1px solid rgba(56, 189, 248, 0.3)';
+				statusDiv.style.color = 'var(--accent)';
+				statusDiv.innerHTML =
+					'<i class="fa-solid fa-spinner fa-spin"></i> Uploading and processing ' +
+					file.name +
+					'...';
+
+				const formData = new FormData();
+				formData.append('file', file);
+
+				try {
+					const res = await fetch('/api/upload_pcap', {
+						method: 'POST',
+						body: formData,
+					});
+
+					const data = await res.json();
+
+					if (data.error) {
+						statusDiv.style.background = 'rgba(239, 68, 68, 0.2)';
+						statusDiv.style.border = '1px solid rgba(239, 68, 68, 0.3)';
+						statusDiv.style.color = 'var(--danger)';
+						statusDiv.innerHTML =
+							'<i class="fa-solid fa-circle-xmark"></i> Error: ' + data.error;
+						return;
+					}
+
+					// Success
+					statusDiv.style.background = 'rgba(34, 197, 94, 0.2)';
+					statusDiv.style.border = '1px solid rgba(34, 197, 94, 0.3)';
+					statusDiv.style.color = 'var(--success)';
+					statusDiv.innerHTML =
+						'<i class="fa-solid fa-circle-check"></i> Loaded ' +
+						data.packet_count +
+						' packets';
+
+					// Update mode
+					pcapMode = true;
+					liveMode = false;
+					updateModeIndicator('pcap', 'PCAP Analysis');
+
+					// Update data info
+					document.getElementById('dataInfo').style.display = 'block';
+					document.getElementById('dataSource').textContent = 'PCAP File';
+					document.getElementById('dataFile').textContent = file.name;
+
+					// Clear existing data first
+					resetEverything(false);
+
+					// Show analytics window
+				//	document.getElementById('stats-window').style.display = 'flex';
+
+					// Load flows and stats automatically
+					await loadFlows();
+					await loadStats();
+
+					// Clear status after 5 seconds
+					setTimeout(() => {
+						statusDiv.style.display = 'none';
+					}, 5000);
+				} catch (e) {
+					console.error('Upload error:', e);
+					statusDiv.style.background = 'rgba(239, 68, 68, 0.2)';
+					statusDiv.style.border = '1px solid rgba(239, 68, 68, 0.3)';
+					statusDiv.style.color = 'var(--danger)';
+					statusDiv.innerHTML =
+						'<i class="fa-solid fa-circle-xmark"></i> Upload failed: ' +
+						e.message;
+				}
+
+				// Clear file input
+				input.value = '';
+			}
+
+			// ============================================================================
+			// PCAP ANALYSIS MODE
+			// ============================================================================
+			async function loadFlows() {
+				if (liveMode) {
+					alert('Stop live capture first to analyze PCAP files');
+					return;
+				}
+
+				const limit = document.getElementById('limitInput').value;
+				const protocol = document.getElementById('protocolFilter').value;
+				const minPackets = document.getElementById('minPackets').value;
+
+				try {
+					const res = await fetch(
+						`/api/flows?limit=${limit}&protocol=${protocol}&min_packets=${minPackets}`,
+					);
+					const data = await res.json();
+
+					if (data.error) {
+						console.error('Error loading flows:', data.error);
+						return;
+					}
+
+					// Clear Old
+					clearPcapVisualizations();
+					const flowList = document.getElementById('flowList');
+					flowList.innerHTML = '';
+
+					// Update flow count
+					document.getElementById('flowCount').textContent = data.flows.length;
+
+					// Render New
+					data.flows.forEach((flow) => {
+						if (!flow.src.lat || !flow.dst.lat) return;
+
+						// Determine colors based on protocol (similar to live capture)
+						const lineColor =
+							flow.stats.protocol === 'TCP' ? '#3b82f6' : '#8b5cf6';
+
+						// Line - dashed and thinner (same as live)
+						const line = L.polyline(
+							[
+								[flow.src.lat, flow.src.lon],
+								[flow.dst.lat, flow.dst.lon],
+							],
+							{
+								color: '#22c55e',  // green = completed data
+                                weight: 2,
+                                opacity: 0.7,
+                                dashArray: null,
+							},
+						).addTo(map);
+
+						line.on('click', () => showDetails(flow.src.ip, flow.dst.ip));
+
+						// Markers with popups (same style as live capture)
+						const srcColor = '#2563eb';
+						const dstColor = '#7c3aed';
+
+						const mSrc = L.circleMarker([flow.src.lat, flow.src.lon], {
+							radius: 4,
+							fillColor: srcColor,
+							color: 'rgba(37,99,235,0.25)',
+							weight: 6,
+							opacity: 0.2,
+							fillOpacity: 1,
+						}).addTo(map);
+
+						const mDst = L.circleMarker([flow.dst.lat, flow.dst.lon], {
+							radius: 4,
+							fillColor: dstColor,
+							color: 'rgba(124,58,237,0.25)',
+							weight: 6,
+							opacity: 0.2,
+							fillOpacity: 1,
+						}).addTo(map);
+
+						// Add popups with location info (including ASN)
+						mSrc.bindPopup(`
+                        <div style="color: #000; font-size: 11px;">
+                            <strong>${flow.src.city}, ${flow.src.country}</strong><br>
+                            IP: ${flow.src.ip}<br>
+                            ${flow.src.isp ? 'ISP: ' + flow.src.isp + '<br>' : ''}
+                            ${flow.src.asn ? 'ASN: ' + flow.src.asn : ''}
+                        </div>
+                    `);
+
+						mDst.bindPopup(`
+                        <div style="color: #000; font-size: 11px;">
+                            <strong>${flow.dst.city}, ${flow.dst.country}</strong><br>
+                            IP: ${flow.dst.ip}<br>
+                            ${flow.dst.isp ? 'ISP: ' + flow.dst.isp + '<br>' : ''}
+                            ${flow.dst.asn ? 'ASN: ' + flow.dst.asn : ''}
+                        </div>
+                    `);
+
+						markers.push(mSrc, mDst);
+						flowLines.push(line);
+
+						// List Item
+						const div = document.createElement('div');
+						div.className = 'flow-item';
+						div.innerHTML = `
+                        <div style="display:flex; justify-content:space-between; color: #fff; font-size: 11px;">
+                            <span style="color: var(--accent);">${flow.src.ip}</span> 
+                            <i class="fa-solid fa-arrow-right" style="font-size:9px; opacity:0.5;"></i> 
+                            <span style="color: #f472b6;">${flow.dst.ip}</span>
+                        </div>
+                        <div style="color:var(--text-muted); margin-top:3px; font-size: 10px; display: flex; justify-content: space-between;">
+                            <span>${flow.stats.packet_count} pkts</span>
+                            <span>${flow.src.city} → ${flow.dst.city}</span>
+                        </div>
+                    `;
+						div.onclick = () => {
+							map.flyTo([flow.src.lat, flow.src.lon], 5);
+							showDetails(flow.src.ip, flow.dst.ip);
+						};
+						flowList.appendChild(div);
+					});
+
+					loadStats();
+				} catch (e) {
+					console.error('Error loading flows:', e);
+				}
+			}
+
+			// --- DPI Details ---
+			async function showDetails(src, dst) {
+				const win = document.getElementById('details-window');
+				if (!win) {
+					console.error('Details window not found');
+					return;
+				}
+				win.style.display = 'flex';
+
+				const tbody = document.querySelector('#details-window tbody');
+				if (!tbody) {
+					console.error('Details table body not found');
+					return;
+				}
+				tbody.innerHTML =
+					'<tr><td colspan="5" style="text-align:center; padding:20px;">Loading packets...</td></tr>';
+
+				try {
+					const res = await fetch(`/api/flow_details?src=${src}&dst=${dst}`);
+					const data = await res.json();
+
+					if (data.error) {
+						tbody.innerHTML = `<tr><td colspan="5" style="text-align:center; padding:20px; color: var(--danger);">${data.error}</td></tr>`;
+						return;
+					}
+
+					tbody.innerHTML = data.packets
+						.map(
+							(p) => `
+                    <tr style="border-bottom: 1px solid rgba(255,255,255,0.05);">
+                        <td style="padding: 6px;">${p.number}</td>
+                        <td style="padding: 6px;">${new Date(p.time * 1000).toLocaleTimeString()}</td>
+                        <td style="padding: 6px; color: var(--accent);">${p.protocols.split(':').pop().toUpperCase()}</td>
+                        <td style="padding: 6px;">${p.length} B</td>
+                        <td style="padding: 6px;">${p.ttl || '-'}</td>
+                    </tr>
+                `,
+						)
+						.join('');
+				} catch (e) {
+					console.error('Error loading details:', e);
+					tbody.innerHTML =
+						'<tr><td colspan="5" style="text-align:center; padding:20px; color: var(--danger);">Error loading packets</td></tr>';
+				}
+			}
+
+			// --- Time Slider ---
+			function formatTime(ts) {
+				return new Date(ts * 1000).toLocaleTimeString('en-US', {
+					hour12: false,
+					hour: '2-digit',
+					minute: '2-digit',
+					second: '2-digit',
+				});
+			}
+
+			// --- Helpers ---
+			function getFlowColor(c) {
+				return c > 100 ? '#ef4444' : c > 50 ? '#f59e0b' : '#38bdf8';
+			}
+
+			function toggleWindow(id) {
+    const el = document.getElementById(id);
+
+    if (!el) return;
+
+    if (el.style.display === "none" || el.style.display === "") {
+        el.style.display = "flex";
+    } else {
+        el.style.display = "none";
+    }
+}
+
+			function minimizeWindow(id) {
+				const el = document.getElementById(id);
+				el.classList.toggle('minimized');
+			}
+
+			// --- Live Packet List Management ---
+			let livePacketList = [];
+			let packetCounter = 0;
+
+			function updateLivePacketList(packet) {
+				packetCounter++;
+				const packetData = {
+					...packet,
+					number: packetCounter,
+				};
+
+				livePacketList.unshift(packetData); // Add to beginning
+				if (livePacketList.length > 20) {
+					livePacketList.pop(); // Keep only last 20
+				}
+
+				renderPacketList();
+			}
+
+			function renderPacketList() {
+				const tbody = document.getElementById('packetTableBody');
+				const countSpan = document.getElementById('packetCount');
+
+				if (livePacketList.length === 0) {
+					tbody.innerHTML =
+						'<tr><td colspan="6" style="text-align: center; padding: 15px; color: var(--text-muted);">No packets yet</td></tr>';
+					countSpan.textContent = '0';
+					return;
+				}
+
+				countSpan.textContent = packetCounter;
+
+				tbody.innerHTML = livePacketList
+					.map((p) => {
+						const time = new Date(p.timestamp * 1000);
+						const timeStr = time.toLocaleTimeString('en-US', {
+							hour12: false,
+							hour: '2-digit',
+							minute: '2-digit',
+							second: '2-digit',
+						});
+						return `
+                <tr style="border-bottom: 1px solid rgba(255,255,255,0.05); cursor: pointer; transition: background 0.2s;" 
+                    onmouseover="this.style.background='rgba(56,189,248,0.1)'" 
+                    onmouseout="this.style.background='transparent'"
+                    onclick="showPacketDetails(${p.number})">
+                    <td style="padding: 4px 6px; font-size: 9px;">${p.number}</td>
+                    <td style="padding: 4px 6px; font-size: 9px;">${timeStr}</td>
+                    <td style="padding: 4px 6px; font-size: 9px; color: var(--accent);">${p.src_ip}:${p.src_port}</td>
+                    <td style="padding: 4px 6px; font-size: 9px; color: #f59e0b;">${p.dst_ip}:${p.dst_port}</td>
+                    <td style="padding: 4px 6px;"><span style="background: ${p.protocol === 'TCP' ? '#2563eb' : '#7c3aed'}; padding: 1px 4px; border-radius: 3px; font-size: 8px;">${p.protocol}</span></td>
+                    <td style="padding: 4px 6px; font-size: 9px;">${p.size}</td>
+                </tr>
+            `;
+					})
+					.join('');
+			}
+
+			function showPacketDetails(packetNumber) {
+				const packet = livePacketList.find((p) => p.number === packetNumber);
+				if (!packet) return;
+
+				const detailsWindow = document.getElementById('packet-details-window');
+				const content = document.getElementById('packetDetailsContent');
+
+				let html = '<div style="font-size: 10px; line-height: 1.5;">';
+
+				// Frame Layer
+				html += `
+                <div style="margin-bottom: 12px;">
+                    <div class="packet-detail-section expanded" style="font-weight: 600; color: var(--accent); margin-bottom: 6px; font-size: 10px;" onclick="togglePacketSection(this)">
+                        <i class="fa-solid fa-chevron-right" style="font-size: 8px;"></i> Frame ${packet.number}
+                    </div>
+                    <div class="packet-detail-content" style="padding-left: 16px; display: block;">
+                        <div style="margin-bottom: 3px;">Timestamp: <span style="color: var(--text-muted);">${new Date(packet.timestamp * 1000).toLocaleString()}</span></div>
+                        <div>Length: <span style="color: var(--text-muted);">${packet.size} bytes</span></div>
+                    </div>
+                </div>
+            `;
+
+				// IP Layer
+				html += `
+                <div style="margin-bottom: 12px;">
+                    <div class="packet-detail-section expanded" style="font-weight: 600; color: var(--accent); margin-bottom: 6px; font-size: 10px;" onclick="togglePacketSection(this)">
+                        <i class="fa-solid fa-chevron-right" style="font-size: 8px;"></i> Internet Protocol (IP)
+                    </div>
+                    <div class="packet-detail-content" style="padding-left: 16px; display: block;">
+                        <div style="margin-bottom: 3px;">Source: <span style="color: var(--text-muted);">${packet.src_ip}</span></div>
+                        <div style="margin-bottom: 3px;">Destination: <span style="color: var(--text-muted);">${packet.dst_ip}</span></div>
+                        <div style="margin-bottom: 3px;">TTL: <span style="color: var(--text-muted);">${packet.ttl || 'N/A'}</span></div>
+                        <div>ID: <span style="color: var(--text-muted);">${packet.id || 'N/A'}</span></div>
+                    </div>
+                </div>
+            `;
+
+				// Transport Layer
+				if (packet.protocol === 'TCP') {
+					html += `
+                    <div style="margin-bottom: 12px;">
+                        <div class="packet-detail-section expanded" style="font-weight: 600; color: var(--accent); margin-bottom: 6px; font-size: 10px;" onclick="togglePacketSection(this)">
+                            <i class="fa-solid fa-chevron-right" style="font-size: 8px;"></i> Transmission Control Protocol (TCP)
+                        </div>
+                        <div class="packet-detail-content" style="padding-left: 16px; display: block;">
+                            <div style="margin-bottom: 3px;">Source Port: <span style="color: var(--text-muted);">${packet.src_port}</span></div>
+                            <div style="margin-bottom: 3px;">Destination Port: <span style="color: var(--text-muted);">${packet.dst_port}</span></div>
+                            <div style="margin-bottom: 3px;">Flags: <span style="color: var(--text-muted);">${packet.flags || 'N/A'}</span></div>
+                            <div style="margin-bottom: 3px;">Sequence Number: <span style="color: var(--text-muted);">${packet.seq || 'N/A'}</span></div>
+                            <div>Acknowledgment Number: <span style="color: var(--text-muted);">${packet.ack || 'N/A'}</span></div>
+                        </div>
+                    </div>
+                `;
+				} else if (packet.protocol === 'UDP') {
+					html += `
+                    <div style="margin-bottom: 12px;">
+                        <div class="packet-detail-section expanded" style="font-weight: 600; color: var(--accent); margin-bottom: 6px; font-size: 10px;" onclick="togglePacketSection(this)">
+                            <i class="fa-solid fa-chevron-right" style="font-size: 8px;"></i> User Datagram Protocol (UDP)
+                        </div>
+                        <div class="packet-detail-content" style="padding-left: 16px; display: block;">
+                            <div style="margin-bottom: 3px;">Source Port: <span style="color: var(--text-muted);">${packet.src_port}</span></div>
+                            <div>Destination Port: <span style="color: var(--text-muted);">${packet.dst_port}</span></div>
+                        </div>
+                    </div>
+                `;
+				}
+
+				// Geolocation Info
+				html += `
+                <div style="margin-bottom: 12px;">
+                    <div class="packet-detail-section expanded" style="font-weight: 600; color: var(--accent); margin-bottom: 6px; font-size: 10px;" onclick="togglePacketSection(this)">
+                        <i class="fa-solid fa-chevron-right" style="font-size: 8px;"></i> Geographic Information
+                    </div>
+                    <div class="packet-detail-content" style="padding-left: 16px; display: block;">
+                        <div style="margin-bottom: 3px;"><strong>Source:</strong> <span style="color: var(--text-muted);">${packet.src_location.city}, ${packet.src_location.country}</span></div>
+                        <div style="margin-bottom: 3px;">ISP: <span style="color: var(--text-muted);">${packet.src_location.isp}</span></div>
+                        <div style="margin-bottom: 6px;">Coords: <span style="color: var(--text-muted);">${packet.src_location.lat.toFixed(4)}, ${packet.src_location.lon.toFixed(4)}</span></div>
+                        <div style="margin-bottom: 3px;"><strong>Destination:</strong> <span style="color: var(--text-muted);">${packet.dst_location.city}, ${packet.dst_location.country}</span></div>
+                        <div style="margin-bottom: 3px;">ISP: <span style="color: var(--text-muted);">${packet.dst_location.isp}</span></div>
+                        <div>Coords: <span style="color: var(--text-muted);">${packet.dst_location.lat.toFixed(4)}, ${packet.dst_location.lon.toFixed(4)}</span></div>
+                    </div>
+                </div>
+            `;
+
+				html += '</div>';
+				content.innerHTML = html;
+				detailsWindow.style.display = 'flex';
+			}
+
+			function togglePacketSection(element) {
+				const content = element.nextElementSibling;
+				const isExpanded = element.classList.contains('expanded');
+
+				if (isExpanded) {
+					element.classList.remove('expanded');
+					content.style.display = 'none';
+				} else {
+					element.classList.add('expanded');
+					content.style.display = 'block';
+				}
+			}
+
+			async function loadStats() {
+				try {
+					const res = await fetch('/api/stats');
+					const data = await res.json();
+
+					if (data.error) {
+						console.error('Error loading stats:', data.error);
+						return;
+					}
+
+					// Update basic stats
+					document.getElementById('totalPackets').innerText =
+						data.total_packets;
+					document.getElementById('uniqueSrc').innerText = data.unique_src_ips;
+
+					// Format total bytes
+					let totalBytes = data.total_bytes;
+					let byteUnit = 'B';
+					if (totalBytes > 1024 * 1024 * 1024) {
+						totalBytes = (totalBytes / (1024 * 1024 * 1024)).toFixed(2);
+						byteUnit = 'GB';
+					} else if (totalBytes > 1024 * 1024) {
+						totalBytes = (totalBytes / (1024 * 1024)).toFixed(2);
+						byteUnit = 'MB';
+					} else if (totalBytes > 1024) {
+						totalBytes = (totalBytes / 1024).toFixed(2);
+						byteUnit = 'KB';
+					}
+					document.getElementById('totalBytes').innerText =
+						totalBytes + ' ' + byteUnit;
+
+					// Average packet size
+					document.getElementById('avgPacketSize').innerText =
+						data.avg_packet_size.toFixed(0) + ' B';
+
+					// Duration
+					let duration = data.duration;
+					let durationStr = '';
+					if (duration > 3600) {
+						durationStr = (duration / 3600).toFixed(1) + ' hrs';
+					} else if (duration > 60) {
+						durationStr = (duration / 60).toFixed(1) + ' min';
+					} else {
+						durationStr = duration.toFixed(1) + ' sec';
+					}
+					document.getElementById('duration').innerText = durationStr;
+
+					// Packet rate
+					document.getElementById('packetRate').innerText =
+						data.packet_rate.toFixed(1);
+
+					// Unknown locations
+					const unknownLocEl = document.getElementById('unknownLocations');
+					if (unknownLocEl) {
+						unknownLocEl.innerText = data.unknown_locations || 0;
+					}
+
+					// VPN IPs count
+					const vpnIpsEl = document.getElementById('vpnIpsCount');
+					if (vpnIpsEl) {
+						vpnIpsEl.innerText = data.vpn_ips_count || 0;
+					}
+
+					// VPN Details
+					const vpnDetailsDiv = document.getElementById('vpnDetails');
+					if (
+						vpnDetailsDiv &&
+						data.vpn_details &&
+						data.vpn_details.length > 0
+					) {
+						vpnDetailsDiv.innerHTML = data.vpn_details
+							.map((v) => {
+								const methodLabels = {
+									keyword: 'ISP Match',
+									asn_database: 'ASN DB',
+									ip_database: 'IP List (X4BNet)',
+									'vpnapi.io': 'vpnapi.io',
+									'ip-api-proxy': 'ip-api Proxy',
+								};
+								const methodLabel =
+									methodLabels[v.method] || v.method || 'Unknown';
+								return `<div style="padding: 6px 8px; border-bottom: 1px solid rgba(245,158,11,0.1); line-height: 1.5;">
+								<div style="display: flex; justify-content: space-between; align-items: center;">
+									<span style="color: #f59e0b; font-weight: 600;">${v.provider}</span>
+									<span style="color: #a78bfa; font-size: 8px; background: rgba(167,139,250,0.1); padding: 1px 5px; border-radius: 3px;" title="Detection method">${methodLabel}</span>
+								</div>
+								<div style="color: var(--text-secondary); margin-top: 2px;">
+									<span style="color: #22c55e;">${v.ip}</span>
+								</div>
+								<div style="color: var(--text-muted); margin-top: 1px;">
+									ISP: ${v.isp} &middot; ${v.city}, ${v.country}
+								</div>
+							</div>`;
+							})
+							.join('');
+					} else if (vpnDetailsDiv) {
+						vpnDetailsDiv.innerHTML =
+							'<div style="text-align: center; padding: 10px; color: var(--text-muted);">No VPN detected</div>';
+					}
+
+					// Top talkers
+					const topTalkersDiv = document.getElementById('topTalkers');
+					if (data.top_talkers && data.top_talkers.length > 0) {
+						topTalkersDiv.innerHTML = data.top_talkers
+							.map((t, i) => {
+								const mb = (t.bytes / (1024 * 1024)).toFixed(2);
+								return `<div style="padding: 4px 6px; border-bottom: 1px solid rgba(255,255,255,0.05); display: flex; justify-content: space-between; align-items: center;">
+                            <span style="flex: 1;">${i + 1}. ${t.ip}</span>
+                            <span style="color: var(--accent); font-size: 9px; margin-left: 8px;">${t.packets} pkts</span>
+                            <span style="color: #22c55e; font-size: 9px; margin-left: 8px;">${mb} MB</span>
+                        </div>`;
+							})
+							.join('');
+					} else {
+						topTalkersDiv.innerHTML =
+							'<div style="text-align: center; padding: 10px; color: var(--text-muted);">No data</div>';
+					}
+
+					// Top destination ports
+					const topPortsDiv = document.getElementById('topPorts');
+					if (data.top_dst_ports && data.top_dst_ports.length > 0) {
+						topPortsDiv.innerHTML = data.top_dst_ports
+							.map((p, i) => {
+								return `<div style="padding: 4px 6px; border-bottom: 1px solid rgba(255,255,255,0.05); display: flex; justify-content: space-between;">
+                            <span>${i + 1}. Port ${p.port}</span>
+                            <span style="color: var(--accent);">${p.count} pkts</span>
+                        </div>`;
+							})
+							.join('');
+					} else {
+						topPortsDiv.innerHTML =
+							'<div style="text-align: center; padding: 10px; color: var(--text-muted);">No data</div>';
+					}
+
+					// Protocol distribution
+					const protocolDistDiv = document.getElementById('protocolDist');
+					if (data.protocols && data.protocols.length > 0) {
+						const totalProtoPackets = data.protocols.reduce(
+							(sum, p) => sum + p.count,
+							0,
+						);
+						protocolDistDiv.innerHTML = data.protocols
+							.map((p, i) => {
+								const percentage = (
+									(p.count / totalProtoPackets) *
+									100
+								).toFixed(1);
+								return `<div style="padding: 4px 6px; border-bottom: 1px solid rgba(255,255,255,0.05); display: flex; justify-content: space-between; align-items: center;">
+                            <span style="flex: 1;">${p.name}</span>
+                            <span style="color: var(--accent); font-size: 9px; margin-left: 8px;">${p.count} pkts</span>
+                            <span style="color: #8b5cf6; font-size: 9px; margin-left: 8px;">${percentage}%</span>
+                        </div>`;
+							})
+							.join('');
+					} else {
+						protocolDistDiv.innerHTML =
+							'<div style="text-align: center; padding: 10px; color: var(--text-muted);">No data</div>';
+					}
+				} catch (e) {
+					console.error('Error loading stats:', e);
+				}
+			}
+
+			// --- Draggable Windows ---
+			interact('.draggable').draggable({
+				allowFrom: '.window-header',
+				listeners: {
+					move(event) {
+						var target = event.target;
+						var x = (parseFloat(target.getAttribute('data-x')) || 0) + event.dx;
+						var y = (parseFloat(target.getAttribute('data-y')) || 0) + event.dy;
+						target.style.transform = 'translate(' + x + 'px, ' + y + 'px)';
+						target.setAttribute('data-x', x);
+						target.setAttribute('data-y', y);
+					},
+				},
+			});
+
+			// ============================================================================
+			// SWITCH MONITORING FUNCTIONS
+			// ============================================================================
+
+			let switchMonitorInterval = null;
+			let switchMonitorActive = false;
+			let switchMapEnabled = false;
+			let switchMapMarkers = {};
+			let switchMapLines = [];
+			let switchMapDeviceMarkers = {};
+			let switchPacketList = [];
+			let switchPacketCounter = 0;
+			let switchLiveMarkers = {};
+			let switchLivePaths = [];
+
+			async function loadSwitchInterfaces() {
+				try {
+					const res = await fetch('/api/interfaces');
+					const data = await res.json();
+					const select = document.getElementById('switchInterface');
+					if (data.interfaces && select) {
+						select.innerHTML =
+							'<option value="">Auto (all interfaces)</option>';
+						data.interfaces.forEach((iface) => {
+							const ipStr =
+								iface.ipv4 && iface.ipv4.length > 0
+									? ` (${iface.ipv4[0]})`
+									: iface.is_ethernet
+										? ' (SPAN port)'
+										: '';
+							const icon = iface.is_ethernet
+								? ' ★'
+								: iface.is_wifi
+									? ' 📶'
+									: '';
+							const label = iface.description || iface.name;
+							const opt = document.createElement('option');
+							opt.value = iface.name;
+							opt.textContent = `${label}${ipStr}${icon}`;
+							if (iface.is_ethernet) opt.selected = true;
+							select.appendChild(opt);
+						});
+					} else if (data.error && select) {
+						select.innerHTML =
+							'<option value="">Error loading interfaces</option>';
+					}
+				} catch (e) {
+					console.error('Failed to load interfaces:', e);
+					const select = document.getElementById('switchInterface');
+					if (select)
+						select.innerHTML =
+							'<option value="">Failed to load — check server</option>';
+				}
+			}
+
+			async function startSwitchMonitor() {
+				const iface = document.getElementById('switchInterface').value;
+				const subnet =
+					document.getElementById('switchSubnet').value || '172.16.0.0/16';
+
+				try {
+					const res = await fetch('/api/switch/start', {
+						method: 'POST',
+						headers: { 'Content-Type': 'application/json' },
+						body: JSON.stringify({ interface: iface || null, subnet: subnet }),
+					});
+					const data = await res.json();
+
+					if (data.status === 'started' || data.status === 'already_running') {
+						switchMonitorActive = true;
+						document.getElementById('switchStartBtn').style.display = 'none';
+						document.getElementById('switchStopBtn').style.display = '';
+						document.getElementById('switchStatusIcon').style.color = '#22c55e';
+						document.getElementById('switchStatusText').textContent =
+							'Monitoring active';
+						document.getElementById('switchStatusText').style.color = '#22c55e';
+
+						// Auto-enable map for live visualization
+						document.getElementById('swMapToggle').checked = true;
+						switchMapEnabled = true;
+						const statusEl = document.getElementById('swMapStatus');
+						if (statusEl) {
+							statusEl.textContent = 'Live';
+							statusEl.style.color = '#22c55e';
+						}
+
+						// Start polling
+						if (switchMonitorInterval) clearInterval(switchMonitorInterval);
+						switchMonitorInterval = setInterval(refreshSwitchData, 3000);
+						refreshSwitchData();
+					} else {
+						alert(data.message || 'Failed to start');
+					}
+				} catch (e) {
+					alert('Error starting switch monitor: ' + e.message);
+				}
+			}
+
+			async function stopSwitchMonitor() {
+				try {
+					const res = await fetch('/api/switch/stop');
+					const data = await res.json();
+
+					switchMonitorActive = false;
+					document.getElementById('switchStartBtn').style.display = '';
+					document.getElementById('switchStopBtn').style.display = 'none';
+					document.getElementById('switchStatusIcon').style.color = '#64748b';
+					document.getElementById('switchStatusText').textContent = 'Stopped';
+					document.getElementById('switchStatusText').style.color = '#94a3b8';
+
+					if (switchMonitorInterval) {
+						clearInterval(switchMonitorInterval);
+						switchMonitorInterval = null;
+					}
+
+					// Clear map markers
+					clearSwitchMap();
+					document.getElementById('swMapToggle').checked = false;
+					switchMapEnabled = false;
+					const statusEl = document.getElementById('swMapStatus');
+					if (statusEl) {
+						statusEl.textContent = 'Off';
+						statusEl.style.color = 'var(--text-muted)';
+					}
+
+					// Final refresh to show summary
+					refreshSwitchData();
+				} catch (e) {
+					console.error('Error stopping switch monitor:', e);
+				}
+			}
+
+			function switchMonitorTab(tab) {
+				const devicesTab = document.getElementById('swDevicesTab');
+				const vpnTab = document.getElementById('swVpnAlertsTab');
+				const packetsTab = document.getElementById('swPacketsTab');
+				const devicesBtn = document.getElementById('swTabDevices');
+				const vpnBtn = document.getElementById('swTabVpn');
+				const packetsBtn = document.getElementById('swTabPackets');
+
+				// Hide all tabs, deactivate all buttons
+				devicesTab.style.display = 'none';
+				vpnTab.style.display = 'none';
+				if (packetsTab) packetsTab.style.display = 'none';
+				devicesBtn.classList.remove('sw-tab-active');
+				vpnBtn.classList.remove('sw-tab-active', 'sw-tab-alert');
+				if (packetsBtn) packetsBtn.classList.remove('sw-tab-active');
+
+				if (tab === 'devices') {
+					devicesTab.style.display = '';
+					devicesBtn.classList.add('sw-tab-active');
+				} else if (tab === 'vpn') {
+					vpnTab.style.display = '';
+					vpnBtn.classList.add('sw-tab-alert');
+				} else if (tab === 'packets') {
+					if (packetsTab) packetsTab.style.display = '';
+					if (packetsBtn) packetsBtn.classList.add('sw-tab-active');
+				}
+			}
+
+			function formatBytes(bytes) {
+				if (bytes > 1024 * 1024 * 1024)
+					return (bytes / (1024 * 1024 * 1024)).toFixed(1) + ' GB';
+				if (bytes > 1024 * 1024)
+					return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+				if (bytes > 1024) return (bytes / 1024).toFixed(1) + ' KB';
+				return bytes + ' B';
+			}
+
+			function timeAgo(timestamp) {
+				const secs = Math.floor(Date.now() / 1000 - timestamp);
+				if (secs < 60) return secs + 's ago';
+				if (secs < 3600) return Math.floor(secs / 60) + 'm ago';
+				return Math.floor(secs / 3600) + 'h ago';
+			}
+
+			async function doSwitchRefresh() {
+				const icon = document.getElementById('switchRefreshIcon');
+				const btn = document.getElementById('switchRefreshBtn');
+				if (icon) icon.classList.add('fa-spin');
+				if (btn) btn.disabled = true;
+				try {
+					await refreshSwitchData();
+					if (switchMapEnabled) await loadSwitchMapData();
+				} finally {
+					if (icon) icon.classList.remove('fa-spin');
+					if (btn) btn.disabled = false;
+				}
+			}
+
+			async function resetSwitchMonitor() {
+				if (
+					!confirm(
+						'Reset all switch monitoring data? This clears all devices, alerts, and map markers.',
+					)
+				)
+					return;
+				try {
+					const res = await fetch('/api/switch/reset');
+					const data = await res.json();
+
+					// Reset UI state
+					switchMonitorActive = false;
+					document.getElementById('switchStartBtn').style.display = '';
+					document.getElementById('switchStopBtn').style.display = 'none';
+					document.getElementById('switchStatusIcon').style.color = '#64748b';
+					document.getElementById('switchStatusText').textContent = 'Reset';
+					document.getElementById('switchStatusText').style.color = '#94a3b8';
+					document.getElementById('swDevices').textContent = '0';
+					document.getElementById('swVpnDevices').textContent = '0';
+					document.getElementById('swAlerts').textContent = '0';
+					document.getElementById('swPackets').textContent = '0';
+					document.getElementById('switchDeviceCount').textContent =
+						'0 devices';
+					document.getElementById('swDevicesList').innerHTML =
+						'<div class="sw-empty-state">Start monitoring to see devices</div>';
+					document.getElementById('swAlertsList').innerHTML =
+						'<div class="sw-empty-state">No VPN alerts yet</div>';
+
+					// Reset packet list
+					switchPacketList = [];
+					switchPacketCounter = 0;
+					const swPktBody = document.getElementById('swPacketTableBody');
+					if (swPktBody)
+						swPktBody.innerHTML =
+							'<tr><td colspan="6" style="text-align: center; padding: 15px; color: var(--text-muted);">No packets yet</td></tr>';
+					const swPktCount = document.getElementById('swPacketCount');
+					if (swPktCount) swPktCount.textContent = '0';
+
+					// Clear polling
+					if (switchMonitorInterval) {
+						clearInterval(switchMonitorInterval);
+						switchMonitorInterval = null;
+					}
+
+					// Clear map
+					clearSwitchMap();
+					document.getElementById('swMapToggle').checked = false;
+					switchMapEnabled = false;
+					const statusEl = document.getElementById('swMapStatus');
+					if (statusEl) {
+						statusEl.textContent = 'Off';
+						statusEl.style.color = 'var(--text-muted)';
+					}
+
+					// Reset VPN tab button
+					const vpnTabBtn = document.getElementById('swTabVpn');
+					if (vpnTabBtn)
+						vpnTabBtn.innerHTML =
+							'<i class="fa-solid fa-shield-halved"></i> VPN Alerts';
+				} catch (e) {
+					console.error('Error resetting switch monitor:', e);
+				}
+			}
+
+			async function refreshSwitchData() {
+				try {
+					// Fetch devices and alerts in parallel
+					const vpnOnly =
+						document.getElementById('swShowVpnOnly')?.checked || false;
+					const [devRes, alertRes, statusRes] = await Promise.all([
+						fetch(`/api/switch/devices?sort=vpn&vpn_only=${vpnOnly}`),
+						fetch('/api/switch/vpn_alerts?limit=50'),
+						fetch('/api/switch/status'),
+					]);
+
+					const devices = await devRes.json();
+					const alerts = await alertRes.json();
+					const status = await statusRes.json();
+
+					// Update summary stats
+					document.getElementById('swDevices').textContent =
+						status.devices_count || 0;
+					document.getElementById('swVpnDevices').textContent =
+						status.vpn_devices_count || 0;
+					document.getElementById('swAlerts').textContent =
+						status.alert_count || 0;
+					document.getElementById('swPackets').textContent =
+						status.total_packets > 1000
+							? (status.total_packets / 1000).toFixed(1) + 'K'
+							: status.total_packets || 0;
+					document.getElementById('switchDeviceCount').textContent =
+						`${status.devices_count || 0} devices`;
+
+					// Update status
+					if (status.monitoring) {
+						document.getElementById('switchStatusIcon').style.color = '#22c55e';
+						document.getElementById('switchStatusText').textContent =
+							'Monitoring active';
+						document.getElementById('switchStatusText').style.color = '#22c55e';
+					}
+
+					// Render devices list
+					const devList = document.getElementById('swDevicesList');
+					if (devices.devices && devices.devices.length > 0) {
+						devList.innerHTML = devices.devices
+							.map((dev) => {
+								const vpnClass = dev.vpn_detected ? 'vpn-detected' : '';
+								const vpnBadge = dev.vpn_detected
+									? `<span class="switch-vpn-badge"><i class="fa-solid fa-shield-halved"></i> VPN DETECTED</span>`
+									: '<span style="font-size: 9px; color: #22c55e;"><i class="fa-solid fa-check-circle"></i> Clean</span>';
+
+								let vpnDetail = '';
+								if (
+									dev.vpn_detected &&
+									dev.vpn_connections &&
+									dev.vpn_connections.length > 0
+								) {
+									vpnDetail = dev.vpn_connections
+										.map((vc) => {
+											return `<div style="padding: 4px 8px; background: rgba(239,68,68,0.06); border-radius: 4px; margin-top: 4px; font-size: 10px;">
+										<span style="color: #f59e0b; font-weight: 600;">${vc.provider}</span>
+										<span style="color: var(--text-muted);"> &rarr; ${vc.external_ip}:${vc.port}</span>
+										<span style="color: #a78bfa; font-size: 8px; margin-left: 4px;">${vc.method}</span>
+										<span style="color: var(--text-muted); font-size: 8px;"> (${vc.packets} pkts, ${formatBytes(vc.bytes)})</span>
+									</div>`;
+										})
+										.join('');
+								}
+
+								return `<div class="switch-device-card ${vpnClass}">
+								<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
+									<span style="font-weight: 600; color: var(--accent); font-family: 'JetBrains Mono', monospace;">
+										<i class="fa-solid fa-laptop" style="margin-right: 4px;"></i>${dev.ip}
+									</span>
+									${vpnBadge}
+								</div>
+								<div style="display: flex; gap: 12px; font-size: 9px; color: var(--text-muted); margin-bottom: 4px;">
+									<span><i class="fa-solid fa-arrow-up-right-from-square"></i> ${dev.total_packets} pkts</span>
+									<span><i class="fa-solid fa-database"></i> ${formatBytes(dev.total_bytes)}</span>
+									<span><i class="fa-solid fa-globe"></i> ${dev.external_ip_count} ext IPs</span>
+									<span><i class="fa-solid fa-clock"></i> ${timeAgo(dev.last_seen)}</span>
+								</div>
+								${dev.vpn_detected ? `<div style="font-size: 9px; color: #ef4444; margin-top: 2px;"><i class="fa-solid fa-triangle-exclamation"></i> VPN traffic: ${dev.vpn_packet_count} pkts (${formatBytes(dev.vpn_bytes)})</div>` : ''}
+								${vpnDetail}
+							</div>`;
+							})
+							.join('');
+					} else {
+						devList.innerHTML =
+							'<div style="text-align: center; padding: 20px; color: var(--text-muted);">No devices detected yet</div>';
+					}
+
+					// Render alerts list
+					const alertList = document.getElementById('swAlertsList');
+					if (alerts.alerts && alerts.alerts.length > 0) {
+						// Update VPN tab button with count badge
+						const vpnTabBtn = document.getElementById('swTabVpn');
+						vpnTabBtn.innerHTML = `<i class="fa-solid fa-shield-halved"></i> VPN Alerts <span style="background: #ef4444; color: #fff; padding: 1px 6px; border-radius: 10px; font-size: 9px; margin-left: 4px; font-weight: 700;">${alerts.total_alerts}</span>`;
+
+						alertList.innerHTML = alerts.alerts
+							.map((alert) => {
+								return `<div class="switch-alert-item severity-${alert.severity}">
+								<div style="display: flex; justify-content: space-between; align-items: center;">
+									<span style="color: #ef4444; font-weight: 600;">
+										<i class="fa-solid fa-triangle-exclamation"></i> ${alert.provider}
+									</span>
+									<span style="font-size: 9px; color: var(--text-muted);">${alert.timestamp_str}</span>
+								</div>
+								<div style="margin-top: 3px;">
+									<span style="color: var(--accent); font-family: 'JetBrains Mono', monospace;">${alert.device_ip}</span>
+									<span style="color: var(--text-muted);"> &rarr; </span>
+									<span style="color: #f59e0b; font-family: 'JetBrains Mono', monospace;">${alert.vpn_server_ip}:${alert.port}</span>
+								</div>
+								<div style="margin-top: 2px; font-size: 9px; color: var(--text-muted);">
+									${alert.protocol} &middot; ${alert.method} &middot;
+									<span style="color: ${alert.severity === 'HIGH' ? '#ef4444' : '#f59e0b'};">${alert.severity}</span>
+								</div>
+							</div>`;
+							})
+							.join('');
+
+						// Show provider summary
+						if (alerts.provider_summary) {
+							const summaryHtml = Object.entries(alerts.provider_summary)
+								.sort((a, b) => b[1] - a[1])
+								.map(
+									([provider, count]) =>
+										`<span style="background: rgba(245,158,11,0.1); padding: 2px 6px; border-radius: 4px; margin: 2px; font-size: 9px; color: #f59e0b;">${provider}: ${count}</span>`,
+								)
+								.join('');
+							alertList.innerHTML =
+								`<div style="margin-bottom: 8px; display: flex; flex-wrap: wrap; gap: 2px;">${summaryHtml}</div>` +
+								alertList.innerHTML;
+						}
+					} else {
+						alertList.innerHTML =
+							'<div style="text-align: center; padding: 20px; color: var(--text-muted);"><i class="fa-solid fa-shield-halved" style="font-size: 24px; margin-bottom: 8px; display: block; color: #22c55e;"></i>No VPN usage detected</div>';
+					}
+				} catch (e) {
+					console.error('Error refreshing switch data:', e);
+				}
+			}
+
+			// ============================================================================
+			// SWITCH MAP FUNCTIONS
+			// ============================================================================
+
+			function toggleSwitchMap() {
+				switchMapEnabled = document.getElementById('swMapToggle').checked;
+				const statusEl = document.getElementById('swMapStatus');
+				if (switchMapEnabled) {
+					statusEl.textContent = 'Live';
+					statusEl.style.color = '#22c55e';
+					loadSwitchMapData();
+				} else {
+					statusEl.textContent = 'Off';
+					statusEl.style.color = 'var(--text-muted)';
+					clearSwitchMap();
+				}
+			}
+
+			function clearSwitchMap() {
+				Object.values(switchMapMarkers).forEach((m) => map.removeLayer(m));
+				Object.values(switchMapDeviceMarkers).forEach((m) =>
+					map.removeLayer(m),
+				);
+				switchMapLines.forEach((l) => map.removeLayer(l));
+				switchMapMarkers = {};
+				switchMapDeviceMarkers = {};
+				switchMapLines = [];
+
+				// Clear live animated markers and paths
+				Object.values(switchLiveMarkers).forEach((m) => map.removeLayer(m));
+				switchLivePaths.forEach((p) => {
+					clearInterval(p.interval);
+					map.removeLayer(p.line);
+				});
+				switchLiveMarkers = {};
+				switchLivePaths = [];
+			}
+
+			async function loadSwitchMapData() {
+				if (!switchMapEnabled) return;
+				try {
+					const res = await fetch('/api/switch/map_data');
+					const data = await res.json();
+					clearSwitchMap();
+
+					// Plot user location as device hub
+					if (data.user_location) {
+						const ul = data.user_location;
+						const hubMarker = L.circleMarker([ul.lat, ul.lon], {
+							radius: 7,
+							fillColor: '#f59e0b',
+							color: 'rgba(245,158,11,0.4)',
+							weight: 8,
+							opacity: 0.3,
+							fillOpacity: 1,
+							className: 'sw-device-marker',
+						}).addTo(map);
+						hubMarker.bindPopup(
+							`<div style="color:#000;font-size:11px;"><strong>Switch Network Hub</strong><br>${ul.city}, ${ul.country}<br><span style="color:#64748b;">${data.device_count} devices monitored</span></div>`,
+						);
+						switchMapDeviceMarkers['hub'] = hubMarker;
+					}
+
+					// Plot external nodes
+					data.nodes.forEach((node) => {
+						const key = `${node.lat},${node.lon}`;
+						if (switchMapMarkers[key]) return;
+
+						const isVpn = node.is_vpn;
+						const marker = L.circleMarker([node.lat, node.lon], {
+							radius: isVpn ? 6 : 4,
+							fillColor: isVpn ? '#ef4444' : '#38bdf8',
+							color: isVpn ? 'rgba(239,68,68,0.35)' : 'rgba(56,189,248,0.25)',
+							weight: isVpn ? 8 : 6,
+							opacity: isVpn ? 0.25 : 0.2,
+							fillOpacity: 1,
+							className: isVpn ? 'vpn-marker' : '',
+						}).addTo(map);
+
+						const vpnLabel = isVpn
+							? `<span style="color:#ef4444;font-weight:700;">⛔ VPN — ${node.vpn_provider || 'Unknown'}</span><br>`
+							: '';
+						marker.bindPopup(`<div style="color:#000;font-size:11px;min-width:140px;">
+							${vpnLabel}
+							<strong>${node.city}, ${node.country}</strong><br>
+							IP: ${node.ip}<br>
+							${node.isp ? 'ISP: ' + node.isp + '<br>' : ''}
+							<span style="color:#64748b;">${node.packets} pkts · ${formatBytes(node.bytes)}</span>
+						</div>`);
+
+						switchMapMarkers[key] = marker;
+					});
+
+					// Draw links
+					data.links.forEach((link) => {
+						const isVpn = link.is_vpn;
+						const line = L.polyline(
+							[
+								[link.src_lat, link.src_lon],
+								[link.dst_lat, link.dst_lon],
+							],
+							{
+								color: isVpn ? '#ef4444' : 'rgba(56,189,248,0.4)',
+								weight: isVpn ? 1.5 : 0.7,
+								opacity: isVpn ? 0.7 : 0.25,
+								dashArray: isVpn ? '6, 4' : '3, 6',
+							},
+						).addTo(map);
+						switchMapLines.push(line);
+					});
+				} catch (e) {
+					console.error('Error loading switch map data:', e);
+				}
+			}
+
+			function addSwitchGeoPacket(pkt) {
+				// Legacy — now handled via handleSwitchLivePacket
+			}
+
+			// ============================================================================
+			// SWITCH LIVE PACKET HANDLER (mirrors handleLivePacket)
+			// ============================================================================
+
+			function handleSwitchLivePacket(packet) {
+				if (!switchMonitorActive) return;
+
+				// Update switch packet table
+				updateSwitchPacketList(packet);
+
+				// Map visualization (only when map toggle is on)
+				if (!switchMapEnabled) return;
+
+				// Add animated markers for source and destination
+				const isDevice = packet.src_location.ip === packet.device_ip;
+				addSwitchLiveMarker(
+					packet.src_location,
+					packet.protocol,
+					isDevice,
+					packet.vpn_detected,
+				);
+				addSwitchLiveMarker(
+					packet.dst_location,
+					packet.protocol,
+					!isDevice,
+					packet.vpn_detected,
+				);
+
+				// Draw animated dashed polyline (same as live capture)
+				const isVpn = packet.vpn_detected;
+				const color = isVpn
+					? '#ef4444'
+					: packet.direction === 'outbound'
+						? '#38bdf8'
+						: '#8b5cf6';
+				const weight = isVpn ? 2.5 : 2;
+				const opacity = isVpn ? 0.8 : 0.6;
+
+				const line = L.polyline(
+					[
+						[packet.src_location.lat, packet.src_location.lon],
+						[packet.dst_location.lat, packet.dst_location.lon],
+					],
+					{
+						color: color,
+						weight: weight,
+						opacity: opacity,
+						dashArray: '10, 10',
+						dashOffset: '0',
+					},
+				).addTo(map);
+
+				// Animate the line by updating dashOffset (same as live capture)
+				let offset = 0;
+				const animateLine = setInterval(() => {
+					if (!switchMonitorActive || !switchMapEnabled) {
+						clearInterval(animateLine);
+						return;
+					}
+					offset += 0.5;
+					if (offset > 20) offset = 0;
+					line.setStyle({ dashOffset: offset.toString() });
+				}, 50);
+
+				switchLivePaths.push({ line, interval: animateLine });
+
+				// Keep max 300 paths to avoid map clutter
+				if (switchLivePaths.length > 300) {
+					const old = switchLivePaths.shift();
+					clearInterval(old.interval);
+					map.removeLayer(old.line);
+				}
+			}
+
+			function addSwitchLiveMarker(location, protocol, isDevice, isVpn) {
+				const key = `${location.lat},${location.lon}`;
+
+				if (!switchLiveMarkers[key]) {
+					const color = isVpn
+						? '#ef4444'
+						: isDevice
+							? '#f59e0b'
+							: protocol === 'TCP'
+								? '#3b82f6'
+								: '#8b5cf6';
+					const radius = isVpn ? 6 : isDevice ? 5 : 4;
+
+					const marker = L.circleMarker([location.lat, location.lon], {
+						radius: radius,
+						fillColor: color,
+						color: isVpn
+							? 'rgba(239,68,68,0.35)'
+							: isDevice
+								? 'rgba(245,158,11,0.3)'
+								: 'rgba(255,255,255,0.15)',
+						weight: isVpn ? 8 : isDevice ? 7 : 5,
+						opacity: isVpn ? 0.25 : isDevice ? 0.25 : 0.15,
+						fillOpacity: 1,
+						className: isVpn ? 'vpn-marker' : isDevice ? 'local-ip-marker' : '',
+					}).addTo(map);
+
+					const deviceLabel = isDevice
+						? '<span style="color: #f59e0b; font-weight: bold;">🖥️ DEVICE</span><br>'
+						: '';
+					const vpnLabel = isVpn
+						? `<span style="color:#ef4444;font-weight:700;">⛔ VPN — ${location.vpn_provider || 'Detected'}</span><br>`
+						: '';
+					marker.bindPopup(`
+						<div style="color: #000; font-size: 11px; min-width: 130px;">
+							${deviceLabel}${vpnLabel}
+							<strong>${location.city}, ${location.country}</strong><br>
+							IP: ${location.ip}<br>
+							${location.isp ? 'ISP: ' + location.isp + '<br>' : ''}
+						</div>
+					`);
+
+					switchLiveMarkers[key] = marker;
+				}
+			}
+
+			function updateSwitchPacketList(packet) {
+				switchPacketCounter++;
+				const packetData = {
+					...packet,
+					number: switchPacketCounter,
+				};
+
+				switchPacketList.unshift(packetData);
+				if (switchPacketList.length > 20) {
+					switchPacketList.pop();
+				}
+
+				renderSwitchPacketList();
+			}
+
+			function renderSwitchPacketList() {
+				const tbody = document.getElementById('swPacketTableBody');
+				const countSpan = document.getElementById('swPacketCount');
+				if (!tbody) return;
+
+				if (switchPacketList.length === 0) {
+					tbody.innerHTML =
+						'<tr><td colspan="6" style="text-align: center; padding: 15px; color: var(--text-muted);">No packets yet</td></tr>';
+					if (countSpan) countSpan.textContent = '0';
+					return;
+				}
+
+				if (countSpan) countSpan.textContent = switchPacketCounter;
+
+				tbody.innerHTML = switchPacketList
+					.map((p) => {
+						const time = new Date(p.timestamp * 1000);
+						const timeStr = time.toLocaleTimeString('en-US', {
+							hour12: false,
+							hour: '2-digit',
+							minute: '2-digit',
+							second: '2-digit',
+						});
+						const vpnBadge = p.vpn_detected
+							? '<span style="background:#ef4444;padding:1px 4px;border-radius:3px;font-size:7px;margin-left:3px;">VPN</span>'
+							: '';
+						const dirIcon = p.direction === 'outbound' ? '↑' : '↓';
+						return `
+						<tr style="border-bottom: 1px solid rgba(255,255,255,0.05); cursor: pointer; transition: background 0.2s;"
+							onmouseover="this.style.background='rgba(56,189,248,0.1)'"
+							onmouseout="this.style.background='transparent'">
+							<td style="padding: 4px 6px; font-size: 9px;">${p.number}</td>
+							<td style="padding: 4px 6px; font-size: 9px;">${timeStr}</td>
+							<td style="padding: 4px 6px; font-size: 9px; color: #f59e0b;">${p.device_ip} ${dirIcon}</td>
+							<td style="padding: 4px 6px; font-size: 9px; color: var(--accent);">${p.direction === 'outbound' ? p.dst_ip : p.src_ip}:${p.direction === 'outbound' ? p.dst_port : p.src_port}</td>
+							<td style="padding: 4px 6px;"><span style="background: ${p.protocol === 'TCP' ? '#2563eb' : '#7c3aed'}; padding: 1px 4px; border-radius: 3px; font-size: 8px;">${p.protocol}</span>${vpnBadge}</td>
+							<td style="padding: 4px 6px; font-size: 9px;">${p.size}</td>
+						</tr>
+					`;
+					})
+					.join('');
+			}
+
+			function addVpnEntry(location) {
+    const container = document.getElementById("vpnLiveList");
+    if (!container) return;
+
+    const uniqueKey = location.ip; // you can extend this if needed
+
+    // 🚫 Prevent duplicates
+    if (detectedVPNs.has(uniqueKey)) {
+        return;
+    }
+
+    detectedVPNs.add(uniqueKey);
+
+    // Remove default text
+    if (container.innerText.includes("No VPN")) {
+        container.innerHTML = "";
+    }
+
+    const div = document.createElement("div");
+
+    div.style.padding = "8px";
+    div.style.marginBottom = "6px";
+    div.style.borderRadius = "6px";
+    div.style.background = "rgba(239,68,68,0.1)";
+    div.style.border = "1px solid rgba(239,68,68,0.3)";
+    div.style.fontSize = "12px";
+
+    div.innerHTML = `
+        <strong style="color:#ef4444;">VPN Detected</strong><br>
+        ${location.ip}<br>
+        ${location.city}, ${location.country}<br>
+        ${location.vpn_provider || "Unknown"}
+    `;
+
+    container.prepend(div);
+}
+function getSessionTime() {
+    const selected = document.getElementById("sessionDuration").value;
+
+    if (selected === "custom") {
+        return parseInt(document.getElementById("customSessionTime").value) || 120;
+    }
+
+    return parseInt(selected);
+}
+function startSessionLimit() {
+    if (sessionActive) return;
+
+    sessionActive = true;
+
+    const totalTime = getSessionTime();
+    let timeLeft = totalTime;
+
+    const display = document.getElementById("sessionTimerText");
+
+    if (sessionTimeout) clearTimeout(sessionTimeout);
+    if (sessionInterval) clearInterval(sessionInterval);
+
+    sessionInterval = setInterval(() => {
+        if (!liveMode) return;
+
+        const min = Math.floor(timeLeft / 60);
+        const sec = timeLeft % 60;
+
+        if (display) {
+            display.textContent = `⏱ ${min}:${sec.toString().padStart(2, '0')}`;
+
+            if (timeLeft <= 10) {
+                display.style.color = "#ef4444";
+            } else {
+                display.style.color = "#f59e0b";
+            }
+        }
+
+        timeLeft--;
+
+        if (timeLeft < 0) {
+            clearInterval(sessionInterval);
+        }
+    }, 1000);
+
+    sessionTimeout = setTimeout(async () => {
+        if (liveMode) {
+            alert(`Session ended (${totalTime} sec)`);
+            await stopAndSaveCapture();
+        }
+        sessionActive = false;
+    }, totalTime * 1000);
+}
+			// ============================================================================
+			// INITIALIZATION
+			// ============================================================================
+			window.addEventListener('load', () => {
+				initWebSocket();
+				checkMode();
+				loadSwitchInterfaces();
+				fetchLocalIPs();
+			});
+		</script>
+	</body>
+</html>

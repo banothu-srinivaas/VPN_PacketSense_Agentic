@@ -1,0 +1,1 @@
+digraph callflow { rankdir=LR; UE -> gNB [label="RRC: Service Request\nframe:120"]; gNB -> AMF [label="NGAP: Initial UE message\nframe:121"]; }
